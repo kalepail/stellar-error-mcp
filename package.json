@@ -1,0 +1,24 @@
+{
+  "name": "stellar-error-mpc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/codemode": "^0.3.2",
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "@stellar/stellar-sdk": "^15.0.1",
+    "@stellar/stellar-xdr-json": "^23.0.0",
+    "agents": "^0.8.7",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260331.1",
+    "typescript": "^6.0.2",
+    "wrangler": "^4.79.0"
+  }
+}
