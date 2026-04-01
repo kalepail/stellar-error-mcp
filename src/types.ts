@@ -4,6 +4,7 @@ export interface Env {
   VECTORIZE: VectorizeIndex;
   AI: Ai;
   LOADER: any; // WorkerLoader — Dynamic Workers binding
+  MANAGEMENT_TOKEN?: string;
   STELLAR_ARCHIVE_RPC_TOKEN: string;
   STELLAR_ARCHIVE_RPC_ENDPOINT: string;
   AI_SEARCH_INSTANCE: string;
@@ -16,6 +17,9 @@ export interface FailedTransaction {
   ledgerCloseTime: string;
   resultKind: string;
   soroban: true;
+  /** Primary contracts from the invoke_host_function envelope — used for fingerprinting */
+  primaryContractIds: string[];
+  /** All contracts discovered from envelope + diag + auth + meta — used for context/lookup */
   contractIds: string[];
   operationTypes: string[];
   sorobanOperationTypes: string[];

@@ -10,11 +10,58 @@ import {
   getRawTransaction,
   getAnalysis,
 } from "./storage.js";
-import { decodeXdr, guessXdrType } from "./xdr.js";
+import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
+
+const FIND_TX_HASH_CONCURRENCY = 10;
+
+async function findErrorEntryByTxHash(
+  env: Env,
+  txHash: string,
+) {
+  let cursor: string | undefined;
+
+  do {
+    const listed = await env.ERRORS_BUCKET.list({
+      prefix: "errors/",
+      limit: 1000,
+      cursor,
+    });
+
+    // Process in batches with concurrency cap
+    for (let i = 0; i < listed.objects.length; i += FIND_TX_HASH_CONCURRENCY) {
+      const batch = listed.objects.slice(i, i + FIND_TX_HASH_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (obj) => {
+          const data = await env.ERRORS_BUCKET.get(obj.key);
+          if (!data) return null;
+          try {
+            const entry = await data.json() as any;
+            if (
+              entry &&
+              Array.isArray(entry.txHashes) &&
+              entry.txHashes.includes(txHash)
+            ) {
+              return entry;
+            }
+          } catch {
+            // skip malformed entries
+          }
+          return null;
+        }),
+      );
+      const found = results.find((r) => r !== null);
+      if (found) return found;
+    }
+
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  return null;
+}
 
 function createBaseServer(env: Env) {
   const server = new McpServer({
-    name: "stellar-error-mpc",
+    name: "stellar-error-mcp",
     version: "1.0.0",
   });
 
@@ -154,28 +201,17 @@ function createBaseServer(env: Env) {
           };
         }
 
-        // Search by tx_hash across error entries
-        const listed = await env.ERRORS_BUCKET.list({
-          prefix: "errors/",
-          limit: 1000,
-        });
-        for (const obj of listed.objects) {
-          const data = await env.ERRORS_BUCKET.get(obj.key);
-          if (!data) continue;
-          const entry: any = await data.json();
-          if (
-            Array.isArray(entry.txHashes) &&
-            entry.txHashes.includes(tx_hash)
-          ) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: JSON.stringify(entry, null, 2),
-                },
-              ],
-            };
-          }
+        // Search by tx_hash across paginated error entries
+        const entry = await findErrorEntryByTxHash(env, tx_hash!);
+        if (entry) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(entry, null, 2),
+              },
+            ],
+          };
         }
 
         // Fall back to legacy raw/ storage
@@ -224,6 +260,53 @@ function createBaseServer(env: Env) {
             {
               type: "text" as const,
               text: `Error retrieving entry: ${message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // --- Tool: get_error_example ---
+  server.tool(
+    "get_error_example",
+    "Retrieve the stored example transaction for a deduplicated error fingerprint.",
+    {
+      fingerprint: z
+        .string()
+        .describe("The error fingerprint hash"),
+    },
+    async ({ fingerprint }) => {
+      try {
+        const example = await getExampleTransaction(env, fingerprint);
+        if (!example) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `No example transaction found for fingerprint ${fingerprint}.`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(example, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Error retrieving example transaction: ${message}`,
             },
           ],
         };
@@ -300,7 +383,7 @@ function createBaseServer(env: Env) {
     async ({ xdr_base64, xdr_type }) => {
       try {
         if (xdr_type) {
-          const decoded = decodeXdr(xdr_base64, xdr_type);
+          const decoded = decodeXdrWithType(xdr_base64, xdr_type);
           if (!decoded) {
             return {
               isError: true,
@@ -316,7 +399,7 @@ function createBaseServer(env: Env) {
             content: [
               {
                 type: "text" as const,
-                text: `## Decoded as ${xdr_type}\n\n\`\`\`json\n${JSON.stringify(decoded, null, 2)}\n\`\`\``,
+                text: `## Decoded as ${decoded.type}\n\n\`\`\`json\n${JSON.stringify(decoded.json, null, 2)}\n\`\`\``,
               },
             ],
           };
@@ -336,27 +419,25 @@ function createBaseServer(env: Env) {
           };
         }
 
-        // Prefer common transaction types
-        const preferred = [
-          "TransactionEnvelope",
-          "TransactionResult",
-          "TransactionMeta",
-          "LedgerEntryData",
-          "SorobanTransactionData",
-          "LedgerKey",
-          "DiagnosticEvent",
-          "ScVal",
-        ];
-        const bestType =
-          preferred.find((t) => possibleTypes.includes(t)) ??
-          possibleTypes[0];
+        // Let decodeXdrWithType iterate through types in preferred order
+        const decoded = decodeXdrWithType(xdr_base64);
+        if (!decoded) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Failed to decode XDR. Possible types: ${possibleTypes.join(", ")}.`,
+              },
+            ],
+          };
+        }
 
-        const decoded = decodeXdr(xdr_base64, bestType);
         return {
           content: [
             {
               type: "text" as const,
-              text: `## Decoded as ${bestType}\n\nPossible types: ${possibleTypes.join(", ")}\n\n\`\`\`json\n${JSON.stringify(decoded, null, 2)}\n\`\`\``,
+              text: `## Decoded as ${decoded.type}\n\nPossible types: ${possibleTypes.join(", ")}\n\n\`\`\`json\n${JSON.stringify(decoded.json, null, 2)}\n\`\`\``,
             },
           ],
         };

@@ -64,7 +64,12 @@ async function fetchLedgerRange(
   if (json.error) {
     const errMsg = json.error.message || JSON.stringify(json.error);
     // If we've reached the tip of the chain, return empty result
-    if (errMsg.includes("must be between") || errMsg.includes("cursor")) {
+    if (
+      typeof errMsg === "string" &&
+      /\b(startLedger|cursor)\b.*\bmust be between\b|\bmust be between\b.*\b(startLedger|cursor)\b/i.test(
+        errMsg,
+      )
+    ) {
       return { ledgers: [], cursor: undefined };
     }
     throw new Error(`Archive RPC error: ${errMsg}`);
@@ -428,18 +433,30 @@ function extractFailedSorobanTransactions(
         const resultKind = getProcessingResultKind(processing?.result);
         if (!resultKind || SUCCESS_KINDS.has(resultKind)) continue;
         if (!isSorobanLedgerTransaction(txEntry, processing)) continue;
+        if (typeof txHash !== "string" || txHash.length === 0) continue;
 
         const operationTypes = collectOperationTypes(txEntry);
         const sorobanOperationTypes = collectSorobanOperationTypes(txEntry);
         const invokeCalls = collectInvokeContractCalls(txEntry);
 
-        const diagnosticEvents: unknown[] =
-          (getNestedValue(processing, [
-            "tx_apply_processing",
-            "v4",
-            "diagnostic_events",
-          ]) as unknown[]) ?? [];
+        const rawDiagnosticEvents = getNestedValue(processing, [
+          "tx_apply_processing",
+          "v4",
+          "diagnostic_events",
+        ]);
+        const diagnosticEvents = Array.isArray(rawDiagnosticEvents)
+          ? rawDiagnosticEvents
+          : [];
 
+        // Primary contracts: only from the envelope invoke_host_function (for fingerprinting)
+        const primaryContractIds: string[] = [];
+        for (const call of invokeCalls) {
+          if (typeof call.contractId === "string" && !primaryContractIds.includes(call.contractId)) {
+            primaryContractIds.push(call.contractId);
+          }
+        }
+
+        // All contracts: envelope + diag + auth + meta (for context/lookup)
         const contractIds = collectContractIds(invokeCalls, diagnosticEvents, processing);
 
         const readout = buildErrorReadout(
@@ -456,6 +473,7 @@ function extractFailedSorobanTransactions(
           ledgerCloseTime: String(ledgerCloseTime),
           resultKind,
           soroban: true,
+          primaryContractIds,
           contractIds,
           operationTypes,
           sorobanOperationTypes,

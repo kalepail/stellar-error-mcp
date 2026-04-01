@@ -1,26 +1,23 @@
 import type { Env, FailedTransaction, AnalysisResult } from "./types.js";
-import type { ContractMetadata } from "./contracts.js";
 // XDR decode available via ./xdr.ts but not needed here — RPC returns JSON via xdrFormat: "json"
 
-const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed Soroban smart contract transaction on the Stellar network.
+const SYSTEM_PROMPT = `You are an expert at analyzing failed Stellar/Soroban smart contract transactions. You will receive comprehensive data about a failed transaction including the function called, its arguments, authorization entries, resource limits, diagnostic events, contract specifications with error code definitions, and transaction results.
 
-Analyze the failure and respond with a JSON object containing exactly these fields:
-- "summary": A concise 1-2 sentence description of what went wrong
+Your job is to determine exactly what went wrong and provide actionable guidance. Respond with a JSON object containing exactly these fields:
+
+- "summary": 1-2 sentences describing what failed and why. Be specific — name the function, the error code and its meaning, and what triggered it. Avoid vague language.
 - "errorCategory": One of: "ContractTrapped", "InsufficientBalance", "AuthorizationFailed", "ResourceExhaustion", "InvalidArguments", "ContractNotFound", "SequenceError", "TimeBoundsExceeded", "InternalError", "Other"
-- "likelyCause": The most probable root cause of the failure
-- "suggestedFix": A concrete next debugging step or fix suggestion
-- "confidence": "high", "medium", or "low" based on how much diagnostic info was available
+- "likelyCause": The most probable root cause. Reference specific values from the data — e.g. "amount was 0 but plant() requires > 0", "signature expired at ledger 61922247 but tx landed at 61922248", "CPU instructions budget 500000 was insufficient".
+- "suggestedFix": A concrete, actionable fix. Not "check the parameters" but "pass a non-zero i128 value for the amount parameter" or "increase valid_until_ledger by at least 10 ledgers to account for network latency".
+- "confidence": "high" if error codes and contract spec clearly explain the failure, "medium" if some inference needed, "low" if diagnostic data is sparse.
 
-Analyze ALL available data:
-- The resultKind (transaction-level failure type)
-- Function calls: which function was called, with what arguments — check if arguments are invalid (zero amounts, wrong types, out of range)
-- Authorization entries: check signature ledger bounds (valid_until_ledger vs actual ledger), credential types, and auth contexts for sub-contract calls
-- Resource limits: compare CPU instructions, read/write bytes from the envelope against what was consumed — did the tx run out of resources?
-- Diagnostic events: contract error codes, trap messages, function call traces — these show the exact execution path and where it failed
-- Contract events: non-diagnostic events showing what the contract did before failing
-- Transaction result details: the full result XDR showing the precise failure code path
-- Contract specifications (if provided): use error enum definitions to map error codes to their actual names, and function signatures to understand parameter types and expected inputs
-- The readout summary fields for fee and resource overview`;
+Analysis priorities:
+1. Contract error codes + error enum definitions → map code numbers to named errors (e.g. error 8 = PailExists)
+2. Function signature + arguments → check if inputs violate contract constraints
+3. Authorization entries → check signature ledger bounds and credential validity
+4. Diagnostic event trace → follow the execution path to the failure point
+5. Resource limits vs consumed → identify resource exhaustion
+6. Transaction result details → precise failure code path`;
 
 function buildUserPrompt(
   tx: FailedTransaction,
@@ -35,7 +32,13 @@ function buildUserPrompt(
   parts.push(
     `Soroban Operations: ${tx.sorobanOperationTypes.join(", ")}`,
   );
-  parts.push(`Contract IDs: ${tx.contractIds.join(", ") || "none"}`);
+  parts.push(`Primary Contract IDs: ${tx.primaryContractIds.join(", ") || "none"}`);
+  const additionalContracts = tx.contractIds.filter(
+    (id) => !tx.primaryContractIds.includes(id),
+  );
+  if (additionalContracts.length > 0) {
+    parts.push(`Related Contracts (auth/cross-call): ${additionalContracts.join(", ")}`);
+  }
 
   // Readout summary
   parts.push(`\nReadout:`);
@@ -115,6 +118,11 @@ function buildUserPrompt(
     parts.push(`  ${resultStr}`);
   }
 
+  // --- Contract specifications (high value — placed before verbose events) ---
+  if (contractContext) {
+    parts.push(contractContext);
+  }
+
   // --- Diagnostic events ---
   if (tx.diagnosticEvents.length > 0) {
     parts.push(`\nDiagnostic Events (${tx.diagnosticEvents.length} total, showing first 15):`);
@@ -128,7 +136,7 @@ function buildUserPrompt(
     }
   }
 
-  // --- Contract events (non-diagnostic) ---
+  // --- Contract events (non-diagnostic, least critical) ---
   const contractEvents = extractContractEvents(tx.processingJson);
   if (contractEvents.length > 0) {
     parts.push(`\nContract Events (${contractEvents.length} total, showing first 10):`);
@@ -139,11 +147,13 @@ function buildUserPrompt(
     }
   }
 
-  if (contractContext) {
-    parts.push(contractContext);
+  // Guard: keep total prompt under ~60K chars (~15K tokens) to leave room for response
+  const MAX_PROMPT_CHARS = 60000;
+  let prompt = parts.join("\n");
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    prompt = prompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[... prompt truncated for length]";
   }
-
-  return parts.join("\n");
+  return prompt;
 }
 
 // --- Envelope data extraction helpers ---
