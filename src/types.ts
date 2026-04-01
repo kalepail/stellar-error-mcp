@@ -4,6 +4,7 @@ export interface Env {
   VECTORIZE: VectorizeIndex;
   AI: Ai;
   LOADER: any; // WorkerLoader — Dynamic Workers binding
+  MANAGEMENT_TOKEN?: string;
   STELLAR_ARCHIVE_RPC_TOKEN: string;
   STELLAR_ARCHIVE_RPC_ENDPOINT: string;
   AI_SEARCH_INSTANCE: string;

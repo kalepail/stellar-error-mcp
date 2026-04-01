@@ -1,9 +1,14 @@
-import type { Env, FailedTransaction, ErrorEntry, AnalysisResult } from "./types.js";
-import { buildErrorDescription } from "./fingerprint.js";
+import type {
+  AnalysisResult,
+  Env,
+  ErrorEntry,
+  FailedTransaction,
+} from "./types.js";
 
 const CURSOR_KEY = "last_processed_ledger";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
+const MAX_TX_HASHES_PER_ENTRY = 50;
 
 // --- Error Entry (fingerprint-based, deduplicated) ---
 
@@ -46,7 +51,8 @@ export async function bumpErrorEntry(
   ledgerCloseTime: string,
 ): Promise<void> {
   entry.seenCount += 1;
-  entry.txHashes.push(txHash);
+  entry.txHashes = [...entry.txHashes.filter((hash) => hash !== txHash), txHash]
+    .slice(-MAX_TX_HASHES_PER_ENTRY);
   entry.lastSeen = ledgerCloseTime;
   await storeErrorEntry(env, entry);
 }

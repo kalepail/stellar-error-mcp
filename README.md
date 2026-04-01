@@ -1,4 +1,4 @@
-# stellar-error-mpc
+# stellar-error-mcp
 
 A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, deduplicates and analyzes them with AI, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
 
@@ -6,7 +6,7 @@ A Cloudflare Worker that continuously scans the Stellar blockchain for failed So
 
 1. **Scan** — Every 5 minutes, fetches recent ledgers from the Stellar Archive RPC and extracts failed Soroban transactions (invoke, restore, extend operations).
 2. **Fingerprint** — Computes a SHA-256 fingerprint from contracts, function name, error signatures, and result kind. Duplicate errors increment a counter instead of being re-analyzed.
-3. **Semantic dedup** — New errors are embedded with `bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
+3. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
 4. **Analyze** — Unique errors are sent to a Cloudflare AI model with full transaction context (envelopes, auth, resources, diagnostic events, contract specs). The model returns a structured analysis: summary, category, likely cause, suggested fix, and confidence level.
 5. **Store** — Error entries, example transactions, and contract metadata are persisted to R2. Vectors are indexed in Vectorize. Documents are indexed in AI Search.
 6. **Serve** — An MCP server exposes tools (`diagnose_error`, `get_error`, `get_error_example`) so AI agents can query the knowledge base with natural language or raw XDR blobs.
@@ -42,6 +42,12 @@ Create a `.dev.vars` file with your RPC token:
 STELLAR_ARCHIVE_RPC_TOKEN=your_token_here
 ```
 
+For deployed admin endpoints, also set a management token secret:
+
+```bash
+wrangler secret put MANAGEMENT_TOKEN
+```
+
 ## Development
 
 ```bash
@@ -54,6 +60,8 @@ Trigger a scan manually:
 ```bash
 curl -X POST http://localhost:8787/trigger
 ```
+
+For deployed `/trigger` and `/batch` endpoints, send either `Authorization: Bearer <token>` or `x-management-token: <token>`.
 
 ## Deploy
 
@@ -78,6 +86,12 @@ npm run deploy
 **`get_error`** — Retrieve a specific error entry by fingerprint or find entries containing a transaction hash.
 
 **`get_error_example`** — Get the example transaction stored for a given error.
+
+**`search_errors`** — Return raw matching AI Search chunks without synthesized analysis.
+
+**`decode_xdr`** — Decode base64-encoded Stellar XDR into JSON.
+
+**`list_errors`** — List stored error/example objects in R2.
 
 ## Project structure
 

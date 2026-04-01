@@ -1,5 +1,4 @@
 import type { Env, FailedTransaction, AnalysisResult } from "./types.js";
-import type { ContractMetadata } from "./contracts.js";
 // XDR decode available via ./xdr.ts but not needed here — RPC returns JSON via xdrFormat: "json"
 
 const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed Soroban smart contract transaction on the Stellar network.

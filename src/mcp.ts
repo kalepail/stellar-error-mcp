@@ -10,11 +10,44 @@ import {
   getRawTransaction,
   getAnalysis,
 } from "./storage.js";
-import { decodeXdr, guessXdrType } from "./xdr.js";
+import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
+
+async function findErrorEntryByTxHash(
+  env: Env,
+  txHash: string,
+) {
+  let cursor: string | undefined;
+
+  do {
+    const listed = await env.ERRORS_BUCKET.list({
+      prefix: "errors/",
+      limit: 1000,
+      cursor,
+    });
+
+    for (const obj of listed.objects) {
+      const data = await env.ERRORS_BUCKET.get(obj.key);
+      if (!data) continue;
+      const entry = await data.json();
+      if (
+        entry &&
+        typeof entry === "object" &&
+        Array.isArray((entry as { txHashes?: unknown[] }).txHashes) &&
+        (entry as { txHashes: unknown[] }).txHashes.includes(txHash)
+      ) {
+        return entry;
+      }
+    }
+
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  return null;
+}
 
 function createBaseServer(env: Env) {
   const server = new McpServer({
-    name: "stellar-error-mpc",
+    name: "stellar-error-mcp",
     version: "1.0.0",
   });
 
@@ -154,28 +187,17 @@ function createBaseServer(env: Env) {
           };
         }
 
-        // Search by tx_hash across error entries
-        const listed = await env.ERRORS_BUCKET.list({
-          prefix: "errors/",
-          limit: 1000,
-        });
-        for (const obj of listed.objects) {
-          const data = await env.ERRORS_BUCKET.get(obj.key);
-          if (!data) continue;
-          const entry: any = await data.json();
-          if (
-            Array.isArray(entry.txHashes) &&
-            entry.txHashes.includes(tx_hash)
-          ) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: JSON.stringify(entry, null, 2),
-                },
-              ],
-            };
-          }
+        // Search by tx_hash across paginated error entries
+        const entry = await findErrorEntryByTxHash(env, tx_hash!);
+        if (entry) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(entry, null, 2),
+              },
+            ],
+          };
         }
 
         // Fall back to legacy raw/ storage
@@ -224,6 +246,53 @@ function createBaseServer(env: Env) {
             {
               type: "text" as const,
               text: `Error retrieving entry: ${message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // --- Tool: get_error_example ---
+  server.tool(
+    "get_error_example",
+    "Retrieve the stored example transaction for a deduplicated error fingerprint.",
+    {
+      fingerprint: z
+        .string()
+        .describe("The error fingerprint hash"),
+    },
+    async ({ fingerprint }) => {
+      try {
+        const example = await getExampleTransaction(env, fingerprint);
+        if (!example) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `No example transaction found for fingerprint ${fingerprint}.`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(example, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Error retrieving example transaction: ${message}`,
             },
           ],
         };
@@ -351,12 +420,24 @@ function createBaseServer(env: Env) {
           preferred.find((t) => possibleTypes.includes(t)) ??
           possibleTypes[0];
 
-        const decoded = decodeXdr(xdr_base64, bestType);
+        const decoded = decodeXdrWithType(xdr_base64, bestType);
+        if (!decoded) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text" as const,
+                text: `Failed to decode XDR as ${bestType}. Possible types: ${possibleTypes.join(", ")}.`,
+              },
+            ],
+          };
+        }
+
         return {
           content: [
             {
               type: "text" as const,
-              text: `## Decoded as ${bestType}\n\nPossible types: ${possibleTypes.join(", ")}\n\n\`\`\`json\n${JSON.stringify(decoded, null, 2)}\n\`\`\``,
+              text: `## Decoded as ${decoded.type}\n\nPossible types: ${possibleTypes.join(", ")}\n\n\`\`\`json\n${JSON.stringify(decoded.json, null, 2)}\n\`\`\``,
             },
           ],
         };
