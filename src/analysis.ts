@@ -1,8 +1,18 @@
+import { encode } from "@toon-format/toon";
 import type { Env, FailedTransaction, AnalysisResult } from "./types.js";
 import type { ContractMetadata } from "./contracts.js";
-// XDR decode available via ./xdr.ts but not needed here — RPC returns JSON via xdrFormat: "json"
+import {
+  formatScVal,
+  formatInvokeCall,
+  formatAuthEntry,
+  buildCallStack,
+  renderCallStack,
+  extractStateChanges,
+} from "./format.js";
 
 const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed Soroban smart contract transaction on the Stellar network.
+
+The transaction data is provided in TOON format (compact structured notation with 2-space indentation, arrays show length and field names). The execution trace uses indented arrows: -> for calls, <- for returns, !! for errors.
 
 Analyze the failure and respond with a JSON object containing exactly these fields:
 - "summary": A concise 1-2 sentence description of what went wrong
@@ -13,133 +23,143 @@ Analyze the failure and respond with a JSON object containing exactly these fiel
 
 Analyze ALL available data:
 - The resultKind (transaction-level failure type)
-- Function calls: which function was called, with what arguments — check if arguments are invalid (zero amounts, wrong types, out of range)
-- Authorization entries: check signature ledger bounds (valid_until_ledger vs actual ledger), credential types, and auth contexts for sub-contract calls
-- Resource limits: compare CPU instructions, read/write bytes from the envelope against what was consumed — did the tx run out of resources?
-- Diagnostic events: contract error codes, trap messages, function call traces — these show the exact execution path and where it failed
-- Contract events: non-diagnostic events showing what the contract did before failing
-- Transaction result details: the full result XDR showing the precise failure code path
-- Contract specifications (if provided): use error enum definitions to map error codes to their actual names, and function signatures to understand parameter types and expected inputs
-- The readout summary fields for fee and resource overview`;
+- The sorobanError opResult code (e.g. invoke_host_function_trapped) — this is the most authoritative failure indicator
+- The execution trace: follow the call chain (-> arrows), identify where the error (!! markers) occurred, and check return values (<- arrows) for Error(...) patterns
+- Return value: for failed calls, this often contains the exact contract error code (e.g. Error(contract: 8))
+- Function calls and their arguments — check if arguments are invalid (zero amounts, wrong types, out of range values)
+- Authorization entries: check signature expiration ledger vs actual ledger, credential types, and cross-contract call auth
+- Resource limits: compare CPU instructions and read/write bytes from envelope against what was consumed
+- State changes: what ledger entries were read/created/updated — helps identify missing or expired data
+- Contract specifications (if provided): map numeric error codes to their named variants and doc comments, check function signatures for expected parameter types`;
 
 function buildUserPrompt(
   tx: FailedTransaction,
   contractContext?: string,
 ): string {
-  const parts: string[] = [];
+  // --- Build structured data object for TOON encoding ---
+  const data: Record<string, unknown> = {
+    txHash: tx.txHash,
+    resultKind: tx.resultKind,
+    ledger: tx.ledgerSequence,
+    ledgerCloseTime: tx.ledgerCloseTime,
+    operationTypes: tx.operationTypes,
+    sorobanOperations: tx.sorobanOperationTypes,
+    contractIds: tx.contractIds.length > 0 ? tx.contractIds : "none",
+  };
 
-  parts.push(`Transaction Hash: ${tx.txHash}`);
-  parts.push(`Result Kind: ${tx.resultKind}`);
-  parts.push(`Ledger: ${tx.ledgerSequence} (${tx.ledgerCloseTime})`);
-  parts.push(`Operation Types: ${tx.operationTypes.join(", ")}`);
-  parts.push(
-    `Soroban Operations: ${tx.sorobanOperationTypes.join(", ")}`,
-  );
-  parts.push(`Contract IDs: ${tx.contractIds.join(", ") || "none"}`);
-
-  // Readout summary
-  parts.push(`\nReadout:`);
-  parts.push(`  Fee Bump: ${tx.readout.feeBump}`);
-  parts.push(`  Invoke Call Count: ${tx.readout.invokeCallCount}`);
-  parts.push(`  Contract Count: ${tx.readout.contractCount}`);
-  if (tx.readout.sourceAccount)
-    parts.push(`  Source Account: ${tx.readout.sourceAccount}`);
-  if (tx.readout.nonRefundableResourceFeeCharged !== undefined)
-    parts.push(
-      `  Non-Refundable Fee: ${tx.readout.nonRefundableResourceFeeCharged}`,
-    );
-  if (tx.readout.refundableResourceFeeCharged !== undefined)
-    parts.push(
-      `  Refundable Fee: ${tx.readout.refundableResourceFeeCharged}`,
-    );
-  if (tx.readout.rentFeeCharged !== undefined)
-    parts.push(`  Rent Fee: ${tx.readout.rentFeeCharged}`);
-  if (tx.readout.returnValue !== undefined)
-    parts.push(
-      `  Return Value: ${JSON.stringify(tx.readout.returnValue)}`,
-    );
-  parts.push(
-    `  Has Diagnostic Events: ${tx.readout.hasDiagnosticEvents}`,
-  );
-  if (tx.readout.diagnosticEventCount !== undefined)
-    parts.push(
-      `  Diagnostic Event Count: ${tx.readout.diagnosticEventCount}`,
-    );
-
-  // --- Function calls with arguments ---
-  const invokeCalls = extractInvokeCalls(tx.envelopeJson);
-  if (invokeCalls.length > 0) {
-    parts.push(`\nFunction Calls:`);
-    for (const call of invokeCalls) {
-      parts.push(`  Contract: ${call.contractId ?? "unknown"}`);
-      parts.push(`  Function: ${call.functionName ?? "unknown"}`);
-      if (call.args) {
-        let argsStr = JSON.stringify(call.args);
-        if (argsStr.length > 3000) argsStr = argsStr.slice(0, 3000) + "... [truncated]";
-        parts.push(`  Arguments: ${argsStr}`);
-      }
-    }
+  // --- Soroban-specific error (most authoritative) ---
+  const sorobanError = extractSorobanResultError(tx.processingJson);
+  if (sorobanError) {
+    data.sorobanError = {
+      opResult: sorobanError.opResult,
+      ...(sorobanError.hostFunction ? { detail: sorobanError.hostFunction } : {}),
+    };
   }
 
-  // --- Auth entries (signatures, ledger bounds) ---
+  // --- Return value (often contains contract error code) ---
+  if (tx.readout.returnValue !== undefined && tx.readout.returnValue !== null) {
+    data.returnValue = formatScVal(tx.readout.returnValue);
+  }
+
+  // --- Readout summary ---
+  const readout: Record<string, unknown> = {
+    feeBump: tx.readout.feeBump,
+    invokeCallCount: tx.readout.invokeCallCount,
+    contractCount: tx.readout.contractCount,
+  };
+  if (tx.readout.sourceAccount) readout.sourceAccount = tx.readout.sourceAccount;
+  if (tx.readout.feeSourceAccount) readout.feeSourceAccount = tx.readout.feeSourceAccount;
+  if (tx.readout.nonRefundableResourceFeeCharged !== undefined)
+    readout.nonRefundableResourceFee = tx.readout.nonRefundableResourceFeeCharged;
+  if (tx.readout.refundableResourceFeeCharged !== undefined)
+    readout.refundableResourceFee = tx.readout.refundableResourceFeeCharged;
+  if (tx.readout.rentFeeCharged !== undefined)
+    readout.rentFee = tx.readout.rentFeeCharged;
+  data.readout = readout;
+
+  // --- Function calls with ScVal-formatted arguments ---
+  const invokeCalls = extractInvokeCalls(tx.envelopeJson);
+  if (invokeCalls.length > 0) {
+    data.functionCalls = invokeCalls.map((ic) =>
+      formatInvokeCall(ic as Record<string, unknown>),
+    );
+  }
+
+  // --- Auth entries (structured) ---
   const authEntries = extractAuthEntries(tx.envelopeJson);
   if (authEntries.length > 0) {
-    parts.push(`\nAuthorization Entries:`);
-    for (const auth of authEntries) {
-      let authStr = JSON.stringify(auth);
-      if (authStr.length > 2000) authStr = authStr.slice(0, 2000) + "... [truncated]";
-      parts.push(`  ${authStr}`);
-    }
+    data.authEntries = authEntries.map((auth) =>
+      formatAuthEntry(auth as Record<string, unknown>),
+    );
   }
 
   // --- Resource limits from envelope ---
   const resources = extractResourceLimits(tx.envelopeJson);
   if (resources) {
-    parts.push(`\nResource Limits (from envelope):`);
-    if (resources.instructions !== undefined)
-      parts.push(`  CPU Instructions: ${resources.instructions}`);
-    if (resources.readBytes !== undefined)
-      parts.push(`  Read Bytes: ${resources.readBytes}`);
-    if (resources.writeBytes !== undefined)
-      parts.push(`  Write Bytes: ${resources.writeBytes}`);
-    if (resources.extendedMetaDataSizeBytes !== undefined)
-      parts.push(`  Extended Meta Size: ${resources.extendedMetaDataSizeBytes}`);
+    data.resourceLimits = resources;
   }
 
-  // --- Transaction result details ---
+  // --- State changes from result meta ---
+  const stateChanges = extractStateChanges(tx.processingJson);
+  if (stateChanges.length > 0) {
+    data.stateChanges = stateChanges.slice(0, 20).map((sc) => sc.summary);
+  }
+
+  // --- Encode structured data as TOON ---
+  let toonData: string;
+  try {
+    toonData = encode(data, { keyFolding: "safe" });
+  } catch {
+    // Fallback to JSON if TOON encoding fails (e.g. circular refs)
+    toonData = JSON.stringify(data, null, 2);
+  }
+
+  const parts: string[] = [];
+
+  parts.push("```toon");
+  parts.push(toonData);
+  parts.push("```");
+
+  // --- Execution trace (call stack from diagnostic events) ---
+  if (tx.diagnosticEvents.length > 0) {
+    const callStack = buildCallStack(tx.diagnosticEvents);
+    const trace = renderCallStack(callStack);
+    if (trace) {
+      parts.push("");
+      parts.push(`Execution Trace (${tx.diagnosticEvents.length} diagnostic events):`);
+      parts.push("```");
+      parts.push(trace);
+      parts.push("```");
+    }
+  }
+
+  // --- Transaction result details (compact) ---
   const resultDetails = extractResultDetails(tx.processingJson);
   if (resultDetails) {
-    parts.push(`\nTransaction Result Details:`);
     let resultStr = JSON.stringify(resultDetails);
-    if (resultStr.length > 4000) resultStr = resultStr.slice(0, 4000) + "... [truncated]";
-    parts.push(`  ${resultStr}`);
-  }
-
-  // --- Diagnostic events ---
-  if (tx.diagnosticEvents.length > 0) {
-    parts.push(`\nDiagnostic Events (${tx.diagnosticEvents.length} total, showing first 15):`);
-    const events = tx.diagnosticEvents.slice(0, 15);
-    for (let i = 0; i < events.length; i++) {
-      let eventStr = JSON.stringify(events[i]);
-      if (eventStr.length > 2000) {
-        eventStr = eventStr.slice(0, 2000) + "... [truncated]";
-      }
-      parts.push(`  Event ${i + 1}: ${eventStr}`);
-    }
+    if (resultStr.length > 3000) resultStr = resultStr.slice(0, 3000) + "...";
+    parts.push("");
+    parts.push(`Transaction Result: ${resultStr}`);
   }
 
   // --- Contract events (non-diagnostic) ---
   const contractEvents = extractContractEvents(tx.processingJson);
   if (contractEvents.length > 0) {
-    parts.push(`\nContract Events (${contractEvents.length} total, showing first 10):`);
-    for (let i = 0; i < Math.min(contractEvents.length, 10); i++) {
-      let eventStr = JSON.stringify(contractEvents[i]);
-      if (eventStr.length > 1500) eventStr = eventStr.slice(0, 1500) + "... [truncated]";
-      parts.push(`  Event ${i + 1}: ${eventStr}`);
+    const formatted = contractEvents.slice(0, 8).map((evt) => {
+      let s = JSON.stringify(evt);
+      if (s.length > 500) s = s.slice(0, 500) + "...";
+      return s;
+    });
+    parts.push("");
+    parts.push(`Contract Events (${contractEvents.length} total):`);
+    for (const f of formatted) {
+      parts.push(`  ${f}`);
     }
   }
 
+  // --- Contract specifications ---
   if (contractContext) {
+    parts.push("");
     parts.push(contractContext);
   }
 
@@ -150,14 +170,9 @@ function buildUserPrompt(
 
 function extractInvokeCalls(envelope: unknown): any[] {
   const calls: any[] = [];
-  walkJson(envelope, (key, value, parent) => {
+  walkJson(envelope, (key, value) => {
     if (key === "invoke_contract" && value && typeof value === "object") {
-      const ic = value as Record<string, unknown>;
-      calls.push({
-        contractId: ic.contract_address,
-        functionName: ic.function_name,
-        args: ic.args,
-      });
+      calls.push(value);
     }
   });
   return calls;
@@ -170,26 +185,24 @@ function extractAuthEntries(envelope: unknown): any[] {
       entries.push(value);
     }
   });
-  return entries.slice(0, 5); // cap to avoid bloat
+  return entries.slice(0, 5);
 }
 
-function extractResourceLimits(envelope: unknown): {
-  instructions?: number;
-  readBytes?: number;
-  writeBytes?: number;
-  extendedMetaDataSizeBytes?: number;
-} | null {
-  let resources: any = null;
+function extractResourceLimits(envelope: unknown): Record<string, number> | null {
+  let resources: Record<string, number> | null = null;
   walkJson(envelope, (key, value) => {
     if (key === "resources" && value && typeof value === "object") {
       const r = value as Record<string, unknown>;
       if ("instructions" in r || "read_bytes" in r) {
-        resources = {
-          instructions: r.instructions,
-          readBytes: r.read_bytes,
-          writeBytes: r.write_bytes,
-          extendedMetaDataSizeBytes: r.extended_meta_data_size_bytes,
-        };
+        resources = {};
+        if (r.instructions !== undefined)
+          resources.cpuInstructions = Number(r.instructions);
+        if (r.read_bytes !== undefined)
+          resources.readBytes = Number(r.read_bytes);
+        if (r.write_bytes !== undefined)
+          resources.writeBytes = Number(r.write_bytes);
+        if (r.extended_meta_data_size_bytes !== undefined)
+          resources.extendedMetaSize = Number(r.extended_meta_data_size_bytes);
       }
     }
   });
@@ -202,10 +215,46 @@ function extractResultDetails(processing: unknown): unknown {
   return p.result ?? null;
 }
 
+/**
+ * Extract Soroban-specific error codes from the transaction result.
+ * The result path is: result.result.tx_failed[].op_inner.invoke_host_function_*
+ */
+function extractSorobanResultError(processing: unknown): {
+  opResult: string;
+  hostFunction?: string;
+} | null {
+  if (!processing || typeof processing !== "object") return null;
+  const result = (processing as any)?.result?.result;
+  if (!result) return null;
+
+  const txFailed = result.tx_failed ?? result.tx_fee_bump_inner_failed;
+  if (!Array.isArray(txFailed)) return null;
+
+  for (const opResult of txFailed) {
+    if (!opResult || typeof opResult !== "object") continue;
+    const opInner = opResult.op_inner;
+    if (!opInner || typeof opInner !== "object") continue;
+
+    for (const [key, value] of Object.entries(opInner as Record<string, unknown>)) {
+      if (
+        key.startsWith("invoke_host_function") ||
+        key.startsWith("restore_footprint") ||
+        key.startsWith("extend_footprint_ttl")
+      ) {
+        return {
+          opResult: key,
+          hostFunction: typeof value === "string" ? value : JSON.stringify(value),
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 function extractContractEvents(processing: unknown): any[] {
   if (!processing || typeof processing !== "object") return [];
   const events: any[] = [];
-  // Path: tx_apply_processing.v4.events
   const v4 = (processing as any)?.tx_apply_processing?.v4;
   if (v4?.events && Array.isArray(v4.events)) {
     events.push(...v4.events);
@@ -277,7 +326,7 @@ async function runAIWithRetry(
             console.log(
               `Model ${model} failed after ${attempt + 1} attempts, trying fallback...`,
             );
-            break; // try next model
+            break;
           }
           throw error;
         }

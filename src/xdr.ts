@@ -8,6 +8,25 @@ import wasmModule from "@stellar/stellar-xdr-json/stellar_xdr_json_bg.wasm";
 
 let initialized = false;
 
+/**
+ * Preferred XDR type ordering for auto-guessing.
+ * When guess() returns multiple matches, we pick the first match from this list.
+ * Ordered by likelihood in an error-analysis context.
+ */
+const PREFERRED_XDR_TYPES = [
+  "TransactionEnvelope",
+  "TransactionResult",
+  "TransactionMeta",
+  "SorobanTransactionData",
+  "LedgerEntryData",
+  "LedgerKey",
+  "SorobanAuthorizationEntry",
+  "DiagnosticEvent",
+  "ContractEvent",
+  "ScVal",
+  "ScAddress",
+];
+
 function ensureInit() {
   if (!initialized) {
     initSync(wasmModule);
@@ -48,22 +67,8 @@ export function decodeXdr(
     const types = guess(xdrBase64);
     if (types.length === 0) return null;
 
-    // Try the most common Stellar types first
-    const preferred = [
-      "TransactionEnvelope",
-      "TransactionResult",
-      "TransactionMeta",
-      "LedgerEntryData",
-      "LedgerKey",
-      "SorobanTransactionData",
-      "DiagnosticEvent",
-      "ContractEvent",
-      "ScVal",
-      "ScAddress",
-    ];
-
     const bestType =
-      preferred.find((t) => types.includes(t)) ?? types[0];
+      PREFERRED_XDR_TYPES.find((t) => types.includes(t)) ?? types[0];
 
     const jsonStr = decode(bestType, xdrBase64);
     return JSON.parse(jsonStr);
@@ -74,6 +79,7 @@ export function decodeXdr(
 
 /**
  * Decode a base64 XDR blob and return both the type and decoded JSON.
+ * Uses the same preferred-type ordering as decodeXdr for consistency.
  */
 export function decodeXdrWithType(
   xdrBase64: string,
@@ -81,11 +87,19 @@ export function decodeXdrWithType(
 ): { type: string; json: unknown } | null {
   ensureInit();
   try {
-    const type = knownType ?? (guess(xdrBase64)?.[0]);
-    if (!type) return null;
+    if (knownType) {
+      const jsonStr = decode(knownType, xdrBase64);
+      return { type: knownType, json: JSON.parse(jsonStr) };
+    }
 
-    const jsonStr = decode(type, xdrBase64);
-    return { type, json: JSON.parse(jsonStr) };
+    const types = guess(xdrBase64);
+    if (types.length === 0) return null;
+
+    const bestType =
+      PREFERRED_XDR_TYPES.find((t) => types.includes(t)) ?? types[0];
+
+    const jsonStr = decode(bestType, xdrBase64);
+    return { type: bestType, json: JSON.parse(jsonStr) };
   } catch {
     return null;
   }
