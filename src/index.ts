@@ -82,7 +82,7 @@ async function processNewLedgers(
 
     // --- Layer 2: Vector similarity (semantic match) ---
     const description = buildErrorDescription(
-      tx.contractIds,
+      tx.primaryContractIds,
       functionName,
       errorSignatures,
       tx.resultKind,
@@ -124,7 +124,7 @@ async function processNewLedgers(
 
     const entry: ErrorEntry = {
       fingerprint,
-      contractIds: tx.contractIds,
+      contractIds: tx.primaryContractIds,
       functionName,
       errorSignatures,
       resultKind: tx.resultKind,
@@ -162,7 +162,7 @@ async function processNewLedgers(
       await indexErrorVector(env, fingerprint, description, {
         errorCategory: entry.errorCategory,
         functionName,
-        contractIds: tx.contractIds.join(",").slice(0, 200),
+        contractIds: tx.primaryContractIds.join(",").slice(0, 200),
         relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
       });
     } catch (error) {

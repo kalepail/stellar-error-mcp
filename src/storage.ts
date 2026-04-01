@@ -47,6 +47,8 @@ export async function storeErrorEntry(
  * Increment the occurrence count on an existing error entry.
  * Appends the tx hash and updates lastSeen.
  */
+const MAX_TX_HASHES = 100;
+
 export async function bumpErrorEntry(
   env: Env,
   entry: ErrorEntry,
@@ -54,7 +56,9 @@ export async function bumpErrorEntry(
   ledgerCloseTime: string,
 ): Promise<void> {
   entry.seenCount += 1;
-  entry.txHashes.push(txHash);
+  if (entry.txHashes.length < MAX_TX_HASHES) {
+    entry.txHashes.push(txHash);
+  }
   entry.lastSeen = ledgerCloseTime;
   await storeErrorEntry(env, entry);
 }

@@ -349,14 +349,22 @@ function extractFailedSorobanTransactions(
         const decoded = buildDecodedTransactionContext(txEntry, processing);
         const operationTypes = collectOperationTypes(txEntry);
         const sorobanOperationTypes = collectSorobanOperationTypes(txEntry);
+        // Primary contracts: only from the envelope invoke calls (for fingerprinting)
+        const primaryContractIds = [
+          ...new Set(
+            decoded.invokeCalls
+              .map((call) =>
+                typeof call.contractId === "string" ? call.contractId : null,
+              )
+              .filter((value): value is string => value !== null && value.length > 0),
+          ),
+        ];
+
+        // All contracts: envelope + diag + auth + meta (for context/lookup)
         const contractIds = [
           ...new Set(
             [
-              ...decoded.invokeCalls
-                .map((call) =>
-                  typeof call.contractId === "string" ? call.contractId : null,
-                )
-                .filter((value): value is string => value !== null),
+              ...primaryContractIds,
               ...decoded.touchedContractIds,
             ].filter((value) => value.length > 0),
           ),
@@ -376,6 +384,7 @@ function extractFailedSorobanTransactions(
           ledgerCloseTime: String(ledgerCloseTime),
           resultKind,
           soroban: true,
+          primaryContractIds,
           contractIds,
           operationTypes,
           sorobanOperationTypes,

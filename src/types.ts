@@ -74,13 +74,14 @@ export interface DecodedTransactionContext {
 
 export interface ContractFunction {
   name: string;
+  doc?: string;
   inputs: Array<{ name: string; type: string }>;
   outputs: string[];
 }
 
 export interface ContractErrorEnum {
   name: string;
-  cases: Array<{ name: string; value: number }>;
+  cases: Array<{ name: string; value: number; doc?: string }>;
 }
 
 export interface ContractStruct {
@@ -110,6 +111,9 @@ export interface FailedTransaction {
   ledgerCloseTime: string;
   resultKind: string;
   soroban: true;
+  /** Primary contracts from the invoke_host_function envelope — used for fingerprinting */
+  primaryContractIds: string[];
+  /** All contracts discovered from envelope + diag + auth + meta — used for context/lookup */
   contractIds: string[];
   operationTypes: string[];
   sorobanOperationTypes: string[];
