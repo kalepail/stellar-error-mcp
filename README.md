@@ -1,4 +1,4 @@
-# stellar-error-mpc
+# stellar-error-mcp
 
 A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, deduplicates and analyzes them with AI, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
 
@@ -6,7 +6,7 @@ A Cloudflare Worker that continuously scans the Stellar blockchain for failed So
 
 1. **Scan** — Every 5 minutes, fetches recent ledgers from the Stellar Archive RPC and extracts failed Soroban transactions (invoke, restore, extend operations).
 2. **Fingerprint** — Computes a SHA-256 fingerprint from contracts, function name, error signatures, and result kind. Duplicate errors increment a counter instead of being re-analyzed.
-3. **Semantic dedup** — New errors are embedded with `bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
+3. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
 4. **Decode and enrich** — Each failed transaction is normalized into a first-class decoded artifact containing the raw envelope/processing JSON, recursively XDR-decoded views, invoke/auth/resource summaries, operation-level effects, ledger changes, and touched contract IDs.
 5. **Analyze** — Unique errors are sent to a Cloudflare AI model with the full enriched transaction plus contract specs and decoded WASM custom sections, encoded as TOON for high-fidelity LLM input. The model returns a structured analysis: summary, evidence-based classification, likely cause, suggested fix, related codes, debug steps, detailed analysis, and confidence level.
 6. **Store** — Error entries, enriched example transactions, and contract metadata snapshots are persisted to R2. Vectors are indexed in Vectorize. Documents are indexed in AI Search.
@@ -43,6 +43,12 @@ Create a `.dev.vars` file with your RPC token:
 STELLAR_ARCHIVE_RPC_TOKEN=your_token_here
 ```
 
+For deployed admin endpoints, also set a management token secret:
+
+```bash
+wrangler secret put MANAGEMENT_TOKEN
+```
+
 ## Development
 
 ```bash
@@ -55,6 +61,8 @@ Trigger a scan manually:
 ```bash
 curl -X POST http://localhost:8787/trigger
 ```
+
+For deployed `/trigger` and `/batch` endpoints, send either `Authorization: Bearer <token>` or `x-management-token: <token>`.
 
 ## Deploy
 
@@ -81,6 +89,10 @@ npm run deploy
 **`get_error_example`** — Get the stored example transaction record for a fingerprint, including the raw transaction JSON, decoded transaction context, and contract metadata snapshot used during analysis.
 
 **`decode_xdr`** — Decode arbitrary base64 XDR blobs into rich JSON with automatic type guessing.
+
+**`search_errors`** — Return raw matching AI Search chunks without synthesized analysis.
+
+**`list_errors`** — List stored error/example objects in R2.
 
 ## Project structure
 

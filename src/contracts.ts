@@ -53,7 +53,10 @@ export async function getCachedContract(
 
   // Tier 3: R2 (persistent, global)
   const obj = await env.ERRORS_BUCKET.get(`contracts/${contractId}.json`);
-  if (!obj) return null;
+  if (!obj) {
+    memoryCache.set(contractId, null);
+    return null;
+  }
 
   const meta: ContractMetadata = await obj.json();
 
@@ -62,6 +65,7 @@ export async function getCachedContract(
     const age = Date.now() - new Date(meta.fetchedAt).getTime();
     if (age > CACHE_MAX_AGE_MS) {
       console.log(`Contract ${contractId}: cache expired (${Math.floor(age / 86400000)}d old), refetching`);
+      memoryCache.set(contractId, null);
       return null;
     }
   }
