@@ -1,7 +1,10 @@
+import { encode } from "@toon-format/toon";
 import type { Env, FailedTransaction, AnalysisResult } from "./types.js";
-// XDR decode available via ./xdr.ts but not needed here — RPC returns JSON via xdrFormat: "json"
+import type { ContractMetadata } from "./contracts.js";
 
 const SYSTEM_PROMPT = `You are an expert at analyzing failed Stellar/Soroban smart contract transactions. You will receive comprehensive data about a failed transaction including the function called, its arguments, authorization entries, resource limits, diagnostic events, contract specifications with error code definitions, and transaction results.
+
+The data is provided in TOON (Token-Oriented Object Notation) format — a compact encoding of JSON. Key-value pairs use "key: value", arrays use "key[N]:" headers, and tabular arrays use "key[N]{col1,col2}:" with CSV-style rows.
 
 Your job is to determine exactly what went wrong and provide actionable guidance. Respond with a JSON object containing exactly these fields:
 
@@ -19,137 +22,139 @@ Analysis priorities:
 5. Resource limits vs consumed → identify resource exhaustion
 6. Transaction result details → precise failure code path`;
 
+function truncateJson(value: unknown, maxChars: number): string {
+  const str = JSON.stringify(value);
+  if (str.length <= maxChars) return str;
+  return str.slice(0, maxChars) + "...[truncated]";
+}
+
 function buildUserPrompt(
   tx: FailedTransaction,
-  contractContext?: string,
+  contracts?: Map<string, ContractMetadata>,
 ): string {
-  const parts: string[] = [];
-
-  parts.push(`Transaction Hash: ${tx.txHash}`);
-  parts.push(`Result Kind: ${tx.resultKind}`);
-  parts.push(`Ledger: ${tx.ledgerSequence} (${tx.ledgerCloseTime})`);
-  parts.push(`Operation Types: ${tx.operationTypes.join(", ")}`);
-  parts.push(
-    `Soroban Operations: ${tx.sorobanOperationTypes.join(", ")}`,
-  );
-  parts.push(`Primary Contract IDs: ${tx.primaryContractIds.join(", ") || "none"}`);
   const additionalContracts = tx.contractIds.filter(
     (id) => !tx.primaryContractIds.includes(id),
   );
-  if (additionalContracts.length > 0) {
-    parts.push(`Related Contracts (auth/cross-call): ${additionalContracts.join(", ")}`);
-  }
 
-  // Readout summary
-  parts.push(`\nReadout:`);
-  parts.push(`  Fee Bump: ${tx.readout.feeBump}`);
-  parts.push(`  Invoke Call Count: ${tx.readout.invokeCallCount}`);
-  parts.push(`  Contract Count: ${tx.readout.contractCount}`);
-  if (tx.readout.sourceAccount)
-    parts.push(`  Source Account: ${tx.readout.sourceAccount}`);
+  // Build structured prompt data — TOON encodes this compactly
+  const promptData: Record<string, unknown> = {};
+
+  // --- Transaction identity ---
+  promptData.transaction = {
+    hash: tx.txHash,
+    resultKind: tx.resultKind,
+    ledger: tx.ledgerSequence,
+    ledgerCloseTime: tx.ledgerCloseTime,
+    operationTypes: tx.operationTypes,
+    sorobanOperations: tx.sorobanOperationTypes,
+    primaryContracts: tx.primaryContractIds.length > 0
+      ? tx.primaryContractIds
+      : ["none"],
+    ...(additionalContracts.length > 0 && {
+      relatedContracts: additionalContracts,
+    }),
+  };
+
+  // --- Readout summary ---
+  const readout: Record<string, unknown> = {
+    feeBump: tx.readout.feeBump,
+    invokeCallCount: tx.readout.invokeCallCount,
+    contractCount: tx.readout.contractCount,
+    hasDiagnosticEvents: tx.readout.hasDiagnosticEvents,
+  };
+  if (tx.readout.sourceAccount) readout.sourceAccount = tx.readout.sourceAccount;
   if (tx.readout.nonRefundableResourceFeeCharged !== undefined)
-    parts.push(
-      `  Non-Refundable Fee: ${tx.readout.nonRefundableResourceFeeCharged}`,
-    );
+    readout.nonRefundableFee = tx.readout.nonRefundableResourceFeeCharged;
   if (tx.readout.refundableResourceFeeCharged !== undefined)
-    parts.push(
-      `  Refundable Fee: ${tx.readout.refundableResourceFeeCharged}`,
-    );
+    readout.refundableFee = tx.readout.refundableResourceFeeCharged;
   if (tx.readout.rentFeeCharged !== undefined)
-    parts.push(`  Rent Fee: ${tx.readout.rentFeeCharged}`);
+    readout.rentFee = tx.readout.rentFeeCharged;
   if (tx.readout.returnValue !== undefined)
-    parts.push(
-      `  Return Value: ${JSON.stringify(tx.readout.returnValue)}`,
-    );
-  parts.push(
-    `  Has Diagnostic Events: ${tx.readout.hasDiagnosticEvents}`,
-  );
+    readout.returnValue = truncateJson(tx.readout.returnValue, 500);
   if (tx.readout.diagnosticEventCount !== undefined)
-    parts.push(
-      `  Diagnostic Event Count: ${tx.readout.diagnosticEventCount}`,
-    );
+    readout.diagnosticEventCount = tx.readout.diagnosticEventCount;
+  promptData.readout = readout;
 
   // --- Function calls with arguments ---
   const invokeCalls = extractInvokeCalls(tx.envelopeJson);
   if (invokeCalls.length > 0) {
-    parts.push(`\nFunction Calls:`);
-    for (const call of invokeCalls) {
-      parts.push(`  Contract: ${call.contractId ?? "unknown"}`);
-      parts.push(`  Function: ${call.functionName ?? "unknown"}`);
-      if (call.args) {
-        let argsStr = JSON.stringify(call.args);
-        if (argsStr.length > 3000) argsStr = argsStr.slice(0, 3000) + "... [truncated]";
-        parts.push(`  Arguments: ${argsStr}`);
-      }
-    }
+    promptData.functionCalls = invokeCalls.map((call) => ({
+      contract: call.contractId ?? "unknown",
+      function: call.functionName ?? "unknown",
+      ...(call.args && { arguments: truncateJson(call.args, 3000) }),
+    }));
   }
 
-  // --- Auth entries (signatures, ledger bounds) ---
+  // --- Auth entries (pre-truncated as JSON strings) ---
   const authEntries = extractAuthEntries(tx.envelopeJson);
   if (authEntries.length > 0) {
-    parts.push(`\nAuthorization Entries:`);
-    for (const auth of authEntries) {
-      let authStr = JSON.stringify(auth);
-      if (authStr.length > 2000) authStr = authStr.slice(0, 2000) + "... [truncated]";
-      parts.push(`  ${authStr}`);
-    }
+    promptData.authorizationEntries = authEntries.map(
+      (auth) => truncateJson(auth, 2000),
+    );
   }
 
   // --- Resource limits from envelope ---
   const resources = extractResourceLimits(tx.envelopeJson);
   if (resources) {
-    parts.push(`\nResource Limits (from envelope):`);
-    if (resources.instructions !== undefined)
-      parts.push(`  CPU Instructions: ${resources.instructions}`);
-    if (resources.readBytes !== undefined)
-      parts.push(`  Read Bytes: ${resources.readBytes}`);
-    if (resources.writeBytes !== undefined)
-      parts.push(`  Write Bytes: ${resources.writeBytes}`);
-    if (resources.extendedMetaDataSizeBytes !== undefined)
-      parts.push(`  Extended Meta Size: ${resources.extendedMetaDataSizeBytes}`);
+    promptData.resourceLimits = resources;
   }
 
   // --- Transaction result details ---
   const resultDetails = extractResultDetails(tx.processingJson);
   if (resultDetails) {
-    parts.push(`\nTransaction Result Details:`);
-    let resultStr = JSON.stringify(resultDetails);
-    if (resultStr.length > 4000) resultStr = resultStr.slice(0, 4000) + "... [truncated]";
-    parts.push(`  ${resultStr}`);
+    promptData.resultDetails = truncateJson(resultDetails, 4000);
   }
 
-  // --- Contract specifications (high value — placed before verbose events) ---
-  if (contractContext) {
-    parts.push(contractContext);
-  }
-
-  // --- Diagnostic events ---
-  if (tx.diagnosticEvents.length > 0) {
-    parts.push(`\nDiagnostic Events (${tx.diagnosticEvents.length} total, showing first 15):`);
-    const events = tx.diagnosticEvents.slice(0, 15);
-    for (let i = 0; i < events.length; i++) {
-      let eventStr = JSON.stringify(events[i]);
-      if (eventStr.length > 2000) {
-        eventStr = eventStr.slice(0, 2000) + "... [truncated]";
+  // --- Contract specifications (high value — TOON tabular format shines here) ---
+  if (contracts && contracts.size > 0) {
+    const specs: Record<string, unknown> = {};
+    for (const [id, meta] of contracts) {
+      const spec: Record<string, unknown> = {
+        wasmHash: meta.wasmHash,
+      };
+      if (meta.errorEnums.length > 0) {
+        // Tabular: errorCodes[N]{value,name}: rows
+        spec.errorCodes = meta.errorEnums.flatMap((e) =>
+          e.cases.map((c) => ({ value: c.value, name: c.name })),
+        );
       }
-      parts.push(`  Event ${i + 1}: ${eventStr}`);
+      if (meta.functions.length > 0) {
+        // Tabular: functions[N]{name,inputs,outputs}: rows
+        spec.functions = meta.functions.map((fn) => ({
+          name: fn.name,
+          inputs: fn.inputs.map((i) => `${i.name}: ${i.type}`).join(", "),
+          outputs: fn.outputs.join(", ") || "void",
+        }));
+      }
+      if (meta.structs.length > 0) {
+        spec.types = meta.structs.map((s) => ({
+          name: s.name,
+          fields: s.fields.map((f) => `${f.name}: ${f.type}`).join(", "),
+        }));
+      }
+      specs[id] = spec;
     }
+    promptData.contractSpecifications = specs;
+  }
+
+  // --- Diagnostic events (pre-truncated as JSON strings, least critical) ---
+  if (tx.diagnosticEvents.length > 0) {
+    promptData.diagnosticEvents = tx.diagnosticEvents
+      .slice(0, 15)
+      .map((event) => truncateJson(event, 2000));
   }
 
   // --- Contract events (non-diagnostic, least critical) ---
   const contractEvents = extractContractEvents(tx.processingJson);
   if (contractEvents.length > 0) {
-    parts.push(`\nContract Events (${contractEvents.length} total, showing first 10):`);
-    for (let i = 0; i < Math.min(contractEvents.length, 10); i++) {
-      let eventStr = JSON.stringify(contractEvents[i]);
-      if (eventStr.length > 1500) eventStr = eventStr.slice(0, 1500) + "... [truncated]";
-      parts.push(`  Event ${i + 1}: ${eventStr}`);
-    }
+    promptData.contractEvents = contractEvents
+      .slice(0, 10)
+      .map((event) => truncateJson(event, 1500));
   }
 
-  // Guard: keep total prompt under ~60K chars (~15K tokens) to leave room for response
+  // Encode the entire prompt as TOON
   const MAX_PROMPT_CHARS = 60000;
-  let prompt = parts.join("\n");
+  let prompt = encode(promptData);
   if (prompt.length > MAX_PROMPT_CHARS) {
     prompt = prompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[... prompt truncated for length]";
   }
@@ -307,14 +312,14 @@ async function runAIWithRetry(
 export async function analyzeFailedTransaction(
   env: Env,
   tx: FailedTransaction,
-  contractContext?: string,
+  contracts?: Map<string, ContractMetadata>,
 ): Promise<AnalysisResult> {
   const modelId = env.AI_MODEL;
 
   try {
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildUserPrompt(tx, contractContext) },
+      { role: "user", content: buildUserPrompt(tx, contracts) },
     ];
 
     const { text, usedModel } = await runAIWithRetry(env, messages, modelId);

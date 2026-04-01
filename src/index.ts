@@ -183,10 +183,11 @@ async function processNewLedgers(
     }
 
     // --- Fetch contract specs for context ---
+    let contracts: Map<string, import("./contracts.js").ContractMetadata> | undefined;
     let contractContext: string | undefined;
     if (tx.contractIds.length > 0) {
       try {
-        const contracts = await fetchContractsForError(env, tx.contractIds);
+        contracts = await fetchContractsForError(env, tx.contractIds);
         contractContext = buildContractContext(contracts);
       } catch (error) {
         console.log(
@@ -196,11 +197,11 @@ async function processNewLedgers(
     }
 
     // --- New error: analyze with AI (including contract specs) ---
-    const analysis = await analyzeFailedTransaction(env, tx, contractContext);
+    const analysis = await analyzeFailedTransaction(env, tx, contracts);
 
     const entry: ErrorEntry = {
       fingerprint,
-      contractIds: tx.primaryContractIds,
+      contractIds: tx.contractIds,
       functionName,
       errorSignatures,
       resultKind: tx.resultKind,
@@ -229,7 +230,7 @@ async function processNewLedgers(
       await indexErrorVector(env, fingerprint, description, {
         errorCategory: entry.errorCategory,
         functionName,
-        contractIds: tx.primaryContractIds.join(",").slice(0, 200),
+        contractIds: tx.contractIds.join(",").slice(0, 200),
       });
     } catch (error) {
       console.log(
