@@ -23,11 +23,85 @@ import {
 
 const MAX_LEDGERS_PER_CYCLE = 200;
 const COLD_START_LOOKBACK = 50;
+const MANAGEMENT_TOKEN_HEADER = "x-management-token";
 
 interface ProcessOptions {
   maxLedgers?: number;
   startOverride?: number;
   maxFailed?: number;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const encoder = new TextEncoder();
+  const aBytes = encoder.encode(a);
+  const bBytes = encoder.encode(b);
+  let mismatch = aBytes.length === bBytes.length ? 0 : 1;
+  const len = Math.max(aBytes.length, bBytes.length);
+
+  for (let i = 0; i < len; i++) {
+    mismatch |= (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0);
+  }
+
+  return mismatch === 0;
+}
+
+function getManagementTokenFromRequest(request: Request): string | null {
+  const authorization = request.headers.get("authorization");
+  if (authorization) {
+    const [scheme, ...rest] = authorization.split(/\s+/);
+    if (scheme && rest.length > 0 && scheme.toLowerCase() === "bearer") {
+      return rest.join(" ").trim();
+    }
+  }
+
+  const headerToken = request.headers.get(MANAGEMENT_TOKEN_HEADER)?.trim();
+  return headerToken || null;
+}
+
+function requireManagementAccess(
+  request: Request,
+  env: Env,
+): Response | null {
+  const configuredToken = env.MANAGEMENT_TOKEN?.trim();
+  const hostname = new URL(request.url).hostname;
+
+  if (!configuredToken) {
+    if (isLoopbackHostname(hostname)) return null;
+    return Response.json(
+      {
+        status: "error",
+        message:
+          "Management endpoints are disabled until MANAGEMENT_TOKEN is configured.",
+      },
+      { status: 503 },
+    );
+  }
+
+  const providedToken = getManagementTokenFromRequest(request);
+  if (!providedToken || !timingSafeEqual(providedToken, configuredToken)) {
+    return Response.json(
+      {
+        status: "error",
+        message:
+          "Unauthorized. Provide a valid Bearer token or x-management-token header.",
+      },
+      { status: 401 },
+    );
+  }
+
+  return null;
+}
+
+function parsePositiveInteger(
+  rawValue: string | null,
+): number | null {
+  if (!rawValue) return null;
+  const value = Number.parseInt(rawValue, 10);
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 async function processNewLedgers(
@@ -81,8 +155,11 @@ async function processNewLedgers(
     }
 
     // --- Layer 2: Vector similarity (semantic match) ---
+    const descriptionContracts = tx.primaryContractIds.length > 0
+      ? tx.primaryContractIds
+      : tx.contractIds;
     const description = buildErrorDescription(
-      tx.primaryContractIds,
+      descriptionContracts,
       functionName,
       errorSignatures,
       tx.resultKind,
@@ -106,8 +183,8 @@ async function processNewLedgers(
     }
 
     // --- Fetch contract specs for context ---
-    let contractContext: string | undefined;
     let contracts: Map<string, ContractMetadata> | undefined;
+    let contractContext: string | undefined;
     if (tx.contractIds.length > 0) {
       try {
         contracts = await fetchContractsForError(env, tx.contractIds);
@@ -124,7 +201,7 @@ async function processNewLedgers(
 
     const entry: ErrorEntry = {
       fingerprint,
-      contractIds: tx.primaryContractIds,
+      contractIds: tx.contractIds,
       functionName,
       errorSignatures,
       resultKind: tx.resultKind,
@@ -162,7 +239,7 @@ async function processNewLedgers(
       await indexErrorVector(env, fingerprint, description, {
         errorCategory: entry.errorCategory,
         functionName,
-        contractIds: tx.primaryContractIds.join(",").slice(0, 200),
+        contractIds: tx.contractIds.join(",").slice(0, 200),
         relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
       });
     } catch (error) {
@@ -200,21 +277,27 @@ export default {
 
     // Manual trigger for testing the cron pipeline
     if (url.pathname === "/trigger" && request.method === "POST") {
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
       try {
         await processNewLedgers(env);
         const lastLedger = await getLastProcessedLedger(env);
         return Response.json({ status: "ok", lastProcessedLedger: lastLedger });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const stack = error instanceof Error ? error.stack : undefined;
-        return Response.json({ status: "error", message, stack }, { status: 500 });
+        console.error("Error while handling /trigger request:", error);
+        return Response.json({ status: "error", message }, { status: 500 });
       }
     }
 
     // Batch processing — scan a large range of ledgers
     // POST /batch?hours=24 or POST /batch?start=61905000&end=61922000
     if (url.pathname === "/batch" && request.method === "POST") {
-      const hours = parseInt(url.searchParams.get("hours") ?? "0");
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
+      const hours = parsePositiveInteger(url.searchParams.get("hours"));
       const startParam = url.searchParams.get("start");
       const endParam = url.searchParams.get("end");
 
@@ -222,9 +305,17 @@ export default {
       let batchEnd: number;
 
       if (startParam && endParam) {
-        batchStart = parseInt(startParam);
-        batchEnd = parseInt(endParam);
-      } else if (hours > 0) {
+        const parsedStart = parsePositiveInteger(startParam);
+        const parsedEnd = parsePositiveInteger(endParam);
+        if (parsedStart === null || parsedEnd === null || parsedEnd <= parsedStart) {
+          return Response.json(
+            { error: "Provide numeric start/end values with end > start." },
+            { status: 400 },
+          );
+        }
+        batchStart = parsedStart;
+        batchEnd = parsedEnd;
+      } else if (hours !== null) {
         batchEnd = await getLatestLedger(env);
         batchStart = batchEnd - Math.floor((hours * 3600) / 5);
       } else {
@@ -257,8 +348,6 @@ export default {
             });
 
             let cursor = batchStart;
-            let totalNew = 0;
-            let totalDuplicates = 0;
 
             while (cursor < batchEnd) {
               const chunkLedgers = Math.min(CHUNK_SIZE, batchEnd - cursor);
@@ -320,7 +409,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/health") {
       const lastLedger = await getLastProcessedLedger(env);
       return Response.json({
-        service: "stellar-error-mpc",
+        service: "stellar-error-mcp",
         status: "ok",
         lastProcessedLedger: lastLedger,
         endpoints: {

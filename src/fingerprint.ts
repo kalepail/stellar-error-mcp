@@ -23,10 +23,14 @@ export async function buildFingerprint(
       ? tx.decoded.errorSignatures
       : extractErrorSignatures(tx.diagnosticEvents);
 
-  // Use primaryContractIds (envelope only) for stable fingerprinting —
-  // the full contractIds set includes auth/diag contracts that vary per user
+  // Use primaryContractIds for stable fingerprinting (avoids auth-chain churn),
+  // but fall back to full contractIds for non-invoke ops where primary is empty
+  const fingerprintContracts = tx.primaryContractIds.length > 0
+    ? tx.primaryContractIds
+    : tx.contractIds;
+
   const parts = [
-    tx.primaryContractIds.slice().sort().join(","),
+    fingerprintContracts.slice().sort().join(","),
     functionName,
     errorSignatures.map((s) => `${s.type}:${s.code}`).join(","),
     tx.resultKind,

@@ -9,6 +9,18 @@ import { parse, isSafeNumber } from "lossless-json";
 import wasmModule from "@stellar/stellar-xdr-json/stellar_xdr_json_bg.wasm";
 
 let initialized = false;
+const PREFERRED_XDR_TYPES = [
+  "TransactionEnvelope",
+  "TransactionResult",
+  "TransactionMeta",
+  "LedgerEntryData",
+  "LedgerKey",
+  "SorobanTransactionData",
+  "DiagnosticEvent",
+  "ContractEvent",
+  "ScVal",
+  "ScAddress",
+];
 
 function ensureInit() {
   if (!initialized) {
@@ -25,6 +37,16 @@ function parseDecodedJson(jsonString: string): unknown {
   });
 }
 
+function normalizeXdrBase64(xdrBase64: string): string {
+  return xdrBase64.trim();
+}
+
+function orderTypesByPreference(types: string[]): string[] {
+  const prioritized = PREFERRED_XDR_TYPES.filter((type) => types.includes(type));
+  const remaining = types.filter((type) => !prioritized.includes(type));
+  return [...prioritized, ...remaining];
+}
+
 /**
  * Guess the XDR type(s) of a base64-encoded XDR blob.
  * Returns an array of possible type names (e.g. ["TransactionEnvelope", "TransactionResult"]).
@@ -32,7 +54,7 @@ function parseDecodedJson(jsonString: string): unknown {
 export function guessXdrType(xdrBase64: string): string[] {
   ensureInit();
   try {
-    return guess(xdrBase64);
+    return guess(normalizeXdrBase64(xdrBase64));
   } catch {
     return [];
   }
@@ -40,7 +62,8 @@ export function guessXdrType(xdrBase64: string): string[] {
 
 /**
  * Decode a base64-encoded XDR blob to rich SEP-51 JSON.
- * If type is known, pass it directly. Otherwise, uses guess() to find the type.
+ * If type is known, pass it directly. Otherwise, uses guess() to find the type
+ * and iterates through candidates in preferred order.
  * Returns the parsed JSON object, or null if decoding fails.
  */
 export function decodeXdr(
@@ -48,35 +71,27 @@ export function decodeXdr(
   knownType?: string,
 ): unknown {
   ensureInit();
+  const normalized = normalizeXdrBase64(xdrBase64);
   try {
     if (knownType) {
-      const jsonStr = decode(knownType, xdrBase64);
+      const jsonStr = decode(knownType, normalized);
       return parseDecodedJson(jsonStr);
     }
 
     // Auto-guess the type
-    const types = guess(xdrBase64);
+    const types = guess(normalized);
     if (types.length === 0) return null;
 
-    // Try the most common Stellar types first
-    const preferred = [
-      "TransactionEnvelope",
-      "TransactionResult",
-      "TransactionMeta",
-      "LedgerEntryData",
-      "LedgerKey",
-      "SorobanTransactionData",
-      "DiagnosticEvent",
-      "ContractEvent",
-      "ScVal",
-      "ScAddress",
-    ];
+    for (const type of orderTypesByPreference(types)) {
+      try {
+        const jsonStr = decode(type, normalized);
+        return parseDecodedJson(jsonStr);
+      } catch {
+        continue;
+      }
+    }
 
-    const bestType =
-      preferred.find((t) => types.includes(t)) ?? types[0];
-
-    const jsonStr = decode(bestType, xdrBase64);
-    return parseDecodedJson(jsonStr);
+    return null;
   } catch {
     return null;
   }
@@ -84,18 +99,27 @@ export function decodeXdr(
 
 /**
  * Decode a base64 XDR blob and return both the type and decoded JSON.
+ * Iterates through candidate types in preferred order.
  */
 export function decodeXdrWithType(
   xdrBase64: string,
   knownType?: string,
 ): { type: string; json: unknown } | null {
   ensureInit();
+  const normalized = normalizeXdrBase64(xdrBase64);
   try {
-    const type = knownType ?? (guess(xdrBase64)?.[0]);
-    if (!type) return null;
-
-    const jsonStr = decode(type, xdrBase64);
-    return { type, json: parseDecodedJson(jsonStr) };
+    const types = knownType
+      ? [knownType]
+      : orderTypesByPreference(guess(normalized));
+    for (const type of types) {
+      try {
+        const jsonStr = decode(type, normalized);
+        return { type, json: parseDecodedJson(jsonStr) };
+      } catch {
+        continue;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -132,14 +156,15 @@ export function deepDecodeXdr(
   if (maxDepth <= 0) return obj;
 
   if (typeof obj === "string") {
+    const normalized = normalizeXdrBase64(obj);
     // Only try to decode strings that look like base64 XDR (> 20 chars, valid base64)
-    if (obj.length > 20 && /^[A-Za-z0-9+/]+=*$/.test(obj)) {
-      const result = decodeXdrWithType(obj);
+    if (normalized.length > 20 && /^[A-Za-z0-9+/]+=*$/.test(normalized)) {
+      const result = decodeXdrWithType(normalized);
       if (result) {
         return {
           _xdrType: result.type,
           _decoded: result.json,
-          _raw: obj.length > 200 ? obj.slice(0, 100) + "..." : obj,
+          _raw: normalized.length > 200 ? normalized.slice(0, 100) + "..." : normalized,
         };
       }
     }

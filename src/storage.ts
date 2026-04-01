@@ -56,9 +56,8 @@ export async function bumpErrorEntry(
   ledgerCloseTime: string,
 ): Promise<void> {
   entry.seenCount += 1;
-  if (entry.txHashes.length < MAX_TX_HASHES) {
-    entry.txHashes.push(txHash);
-  }
+  entry.txHashes = [...entry.txHashes.filter((h) => h !== txHash), txHash]
+    .slice(-MAX_TX_HASHES);
   entry.lastSeen = ledgerCloseTime;
   await storeErrorEntry(env, entry);
 }
