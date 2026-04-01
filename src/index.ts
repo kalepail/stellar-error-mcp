@@ -1,4 +1,4 @@
-import type { Env, ErrorEntry } from "./types.js";
+import type { ContractMetadata, Env, ErrorEntry } from "./types.js";
 import { createMcpFetchHandler } from "./mcp.js";
 import { scanForFailedTransactions, getLatestLedger } from "./stellar.js";
 import {
@@ -183,7 +183,7 @@ async function processNewLedgers(
     }
 
     // --- Fetch contract specs for context ---
-    let contracts: Map<string, import("./contracts.js").ContractMetadata> | undefined;
+    let contracts: Map<string, ContractMetadata> | undefined;
     let contractContext: string | undefined;
     if (tx.contractIds.length > 0) {
       try {
@@ -210,6 +210,10 @@ async function processNewLedgers(
       errorCategory: analysis.errorCategory,
       likelyCause: analysis.likelyCause,
       suggestedFix: analysis.suggestedFix,
+      detailedAnalysis: analysis.detailedAnalysis,
+      evidence: analysis.evidence,
+      relatedCodes: analysis.relatedCodes,
+      debugSteps: analysis.debugSteps,
       confidence: analysis.confidence,
       modelId: analysis.modelId,
       seenCount: 1,
@@ -223,7 +227,12 @@ async function processNewLedgers(
     };
 
     await storeErrorEntry(env, entry);
-    await storeExampleTransaction(env, tx, fingerprint);
+    await storeExampleTransaction(
+      env,
+      tx,
+      fingerprint,
+      contracts ? [...contracts.values()] : [],
+    );
 
     // Index in Vectorize for future similarity checks
     try {
@@ -231,6 +240,7 @@ async function processNewLedgers(
         errorCategory: entry.errorCategory,
         functionName,
         contractIds: tx.contractIds.join(",").slice(0, 200),
+        relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
       });
     } catch (error) {
       console.log(

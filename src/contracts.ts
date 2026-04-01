@@ -1,36 +1,15 @@
 import { xdr, Address, contract } from "@stellar/stellar-sdk";
-import type { Env } from "./types.js";
+import type {
+  ContractCustomSections,
+  ContractErrorEnum,
+  ContractFunction,
+  ContractMetadata,
+  ContractStruct,
+  Env,
+} from "./types.js";
+import { decodeXdrStream } from "./xdr.js";
 
 const { Spec } = contract;
-
-/**
- * Contract metadata — fetched on-chain via getLedgerEntries, cached in R2.
- * Includes the decoded Soroban contract spec (functions, errors, types).
- */
-export interface ContractMetadata {
-  contractId: string;
-  wasmHash: string;
-  functions: ContractFunction[];
-  errorEnums: ContractErrorEnum[];
-  structs: ContractStruct[];
-  fetchedAt: string;
-}
-
-export interface ContractFunction {
-  name: string;
-  inputs: Array<{ name: string; type: string }>;
-  outputs: string[];
-}
-
-export interface ContractErrorEnum {
-  name: string;
-  cases: Array<{ name: string; value: number }>;
-}
-
-export interface ContractStruct {
-  name: string;
-  fields: Array<{ name: string; type: string }>;
-}
 
 // --- R2 Cache ---
 
@@ -38,16 +17,41 @@ export interface ContractStruct {
 const memoryCache = new Map<string, ContractMetadata | null>();
 
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const CONTRACT_SECTION_TYPES = {
+  contractspecv0: "ScSpecEntry",
+  contractmetav0: "ScMetaEntry",
+  contractenvmetav0: "ScEnvMetaEntry",
+} as const;
 
 export async function getCachedContract(
   env: Env,
   contractId: string,
 ): Promise<ContractMetadata | null> {
-  // Check in-memory first (free, same invocation)
+  // Tier 1: In-memory (free, same invocation)
   if (memoryCache.has(contractId)) {
     return memoryCache.get(contractId)!;
   }
 
+  // Tier 2: Cache API (free, same datacenter, persists across invocations)
+  const cacheKey = new Request(`https://cache.internal/contracts/${contractId}`);
+  try {
+    const cache = caches.default;
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const meta: ContractMetadata = await cached.json();
+      if (meta.fetchedAt) {
+        const age = Date.now() - new Date(meta.fetchedAt).getTime();
+        if (age <= CACHE_MAX_AGE_MS) {
+          memoryCache.set(contractId, meta);
+          return meta;
+        }
+      }
+    }
+  } catch {
+    // Cache API may not be available in local dev
+  }
+
+  // Tier 3: R2 (persistent, global)
   const obj = await env.ERRORS_BUCKET.get(`contracts/${contractId}.json`);
   if (!obj) {
     memoryCache.set(contractId, null);
@@ -67,13 +71,32 @@ export async function getCachedContract(
   }
 
   memoryCache.set(contractId, meta);
+
+  // Backfill Cache API for future invocations
+  try {
+    const cache = caches.default;
+    const cacheResponse = new Response(JSON.stringify(meta), {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=86400", // 24h datacenter-local
+      },
+    });
+    // Fire-and-forget — don't block on cache write
+    cache.put(cacheKey, cacheResponse).catch(() => {});
+  } catch {
+    // Cache API may not be available
+  }
+
   return meta;
 }
 
 async function cacheContract(env: Env, meta: ContractMetadata): Promise<void> {
+  const json = JSON.stringify(meta, null, 2);
+
+  // R2: persistent global cache
   await env.ERRORS_BUCKET.put(
     `contracts/${meta.contractId}.json`,
-    JSON.stringify(meta, null, 2),
+    json,
     {
       httpMetadata: { contentType: "application/json" },
       customMetadata: {
@@ -84,6 +107,21 @@ async function cacheContract(env: Env, meta: ContractMetadata): Promise<void> {
       },
     },
   );
+
+  // Cache API: datacenter-local, free
+  try {
+    const cache = caches.default;
+    const cacheKey = new Request(`https://cache.internal/contracts/${meta.contractId}`);
+    const cacheResponse = new Response(json, {
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "public, max-age=86400",
+      },
+    });
+    cache.put(cacheKey, cacheResponse).catch(() => {});
+  } catch {
+    // Cache API may not be available
+  }
 }
 
 // --- RPC: getLedgerEntries ---
@@ -172,7 +210,8 @@ export async function fetchContractMetadata(
     const wasmBytes = codeLedgerEntry.contractCode().code();
 
     // Step 3: Extract contractspecv0 from WASM and parse with Spec
-    const specSection = extractWasmCustomSection(wasmBytes, "contractspecv0");
+    const specSections = extractWasmCustomSections(wasmBytes, "contractspecv0");
+    const specSection = specSections[0];
     if (!specSection) {
       console.log(`Contract ${contractId}: no contractspecv0 section in WASM`);
       return null;
@@ -180,27 +219,45 @@ export async function fetchContractMetadata(
 
     const spec = new Spec(specSection as any);
 
-    // Extract functions
-    const functions: ContractFunction[] = spec.funcs().map((fn: any) => ({
-      name: fn.name().toString(),
-      inputs: fn.inputs().map((inp: any) => ({
-        name: inp.name().toString(),
-        type: describeSpecType(inp.type()),
-      })),
-      outputs: fn.outputs().map((out: any) => describeSpecType(out)),
-    }));
+    // Extract functions (including doc comments from /// in Rust source)
+    const functions: ContractFunction[] = spec.funcs().map((fn: any) => {
+      const entry: ContractFunction = {
+        name: fn.name().toString(),
+        inputs: fn.inputs().map((inp: any) => ({
+          name: inp.name().toString(),
+          type: describeSpecType(inp.type()),
+        })),
+        outputs: fn.outputs().map((out: any) => describeSpecType(out)),
+      };
+      try {
+        const doc = fn.doc?.()?.toString?.();
+        if (doc) entry.doc = doc;
+      } catch {
+        // doc() may not exist on older SDK versions
+      }
+      return entry;
+    });
 
-    // Extract error enums
+    // Extract error enums (including per-case doc comments)
     const errorCases = spec.errorCases();
     const errorEnums: ContractErrorEnum[] =
       errorCases.length > 0
         ? [
             {
               name: "Error",
-              cases: errorCases.map((c: any) => ({
-                name: c.name().toString(),
-                value: c.value(),
-              })),
+              cases: errorCases.map((c: any) => {
+                const entry: ContractErrorEnum["cases"][number] = {
+                  name: c.name().toString(),
+                  value: c.value(),
+                };
+                try {
+                  const doc = c.doc?.()?.toString?.();
+                  if (doc) entry.doc = doc;
+                } catch {
+                  // doc() may not exist
+                }
+                return entry;
+              }),
             },
           ]
         : [];
@@ -227,12 +284,15 @@ export async function fetchContractMetadata(
       // jsonSchema can fail for some contracts — structs are optional context
     }
 
+    const customSections = decodeKnownContractSections(wasmBytes);
+
     const meta: ContractMetadata = {
       contractId,
       wasmHash: wasmHashHex,
       functions,
       errorEnums,
       structs,
+      customSections,
       fetchedAt: new Date().toISOString(),
     };
 
@@ -265,9 +325,18 @@ export async function fetchContractsForError(
   const results = new Map<string, ContractMetadata>();
   const unique = [...new Set(contractIds)];
 
-  for (const id of unique) {
-    const meta = await fetchContractMetadata(env, id);
-    if (meta) results.set(id, meta);
+  // Fetch all contracts in parallel — each one has its own caching layers
+  const settled = await Promise.allSettled(
+    unique.map(async (id) => {
+      const meta = await fetchContractMetadata(env, id);
+      return { id, meta };
+    }),
+  );
+
+  for (const result of settled) {
+    if (result.status === "fulfilled" && result.value.meta) {
+      results.set(result.value.id, result.value.meta);
+    }
   }
 
   return results;
@@ -276,17 +345,17 @@ export async function fetchContractsForError(
 // --- WASM Custom Section Extraction ---
 
 /**
- * Extract the first custom section with the given name from a WASM binary.
- * This is the only piece of custom binary parsing we need — the SDK handles everything else.
+ * Extract all custom sections with the given name from a WASM binary.
  */
-function extractWasmCustomSection(
+function extractWasmCustomSections(
   wasm: Uint8Array,
   sectionName: string,
-): Uint8Array | null {
-  if (wasm.length < 8) return null;
+): Uint8Array[] {
+  const matches: Uint8Array[] = [];
+  if (wasm.length < 8) return matches;
   // Verify WASM magic: \0asm
   if (wasm[0] !== 0 || wasm[1] !== 0x61 || wasm[2] !== 0x73 || wasm[3] !== 0x6d) {
-    return null;
+    return matches;
   }
 
   let offset = 8; // Skip magic + version
@@ -303,14 +372,36 @@ function extractWasmCustomSection(
       const nameStart = offset + nb;
       const name = new TextDecoder().decode(wasm.slice(nameStart, nameStart + nameLen));
       if (name === sectionName) {
-        return wasm.slice(nameStart + nameLen, sectionEnd);
+        matches.push(wasm.slice(nameStart + nameLen, sectionEnd));
       }
     }
 
     offset = sectionEnd;
   }
 
-  return null;
+  return matches;
+}
+
+function decodeKnownContractSections(
+  wasm: Uint8Array,
+): ContractCustomSections | undefined {
+  const decoded: ContractCustomSections = {};
+
+  for (const [sectionName, xdrType] of Object.entries(CONTRACT_SECTION_TYPES)) {
+    const sections = extractWasmCustomSections(wasm, sectionName);
+    if (sections.length === 0) continue;
+
+    const entries = sections.flatMap((section) => {
+      const xdrBase64 = uint8ArrayToBase64(section);
+      return decodeXdrStream(xdrType, xdrBase64) ?? [];
+    });
+
+    if (entries.length > 0) {
+      decoded[sectionName as keyof ContractCustomSections] = entries;
+    }
+  }
+
+  return Object.keys(decoded).length > 0 ? decoded : undefined;
 }
 
 function readLEB128(
@@ -330,6 +421,16 @@ function readLEB128(
   }
 
   return { value: result, bytesRead };
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
 }
 
 // --- Spec Type Description ---
@@ -420,7 +521,8 @@ export function buildContractContext(
       for (const e of meta.errorEnums) {
         parts.push(`    enum ${e.name} {`);
         for (const c of e.cases) {
-          parts.push(`      ${c.value} = ${c.name}`);
+          const docStr = c.doc ? `  // ${c.doc}` : "";
+          parts.push(`      ${c.value} = ${c.name}${docStr}`);
         }
         parts.push("    }");
       }
@@ -434,6 +536,9 @@ export function buildContractContext(
           .join(", ");
         const ret =
           fn.outputs.length > 0 ? ` -> ${fn.outputs.join(", ")}` : "";
+        if (fn.doc) {
+          parts.push(`    /// ${fn.doc}`);
+        }
         parts.push(`    ${fn.name}(${params})${ret}`);
       }
     }
@@ -447,7 +552,36 @@ export function buildContractContext(
         parts.push(`    struct ${s.name} { ${fields} }`);
       }
     }
+
+    if (meta.customSections?.contractspecv0?.length) {
+      parts.push(
+        `  Raw Spec Entries: ${meta.customSections.contractspecv0.length}`,
+      );
+    }
+    if (meta.customSections?.contractenvmetav0?.length) {
+      parts.push(
+        `  Contract Env Meta Entries: ${meta.customSections.contractenvmetav0.length}`,
+      );
+      parts.push(
+        `  Contract Env Meta Preview: ${renderCustomSectionPreview(meta.customSections.contractenvmetav0)}`,
+      );
+    }
+    if (meta.customSections?.contractmetav0?.length) {
+      parts.push(
+        `  Contract Meta Entries: ${meta.customSections.contractmetav0.length}`,
+      );
+      parts.push(
+        `  Contract Meta Preview: ${renderCustomSectionPreview(meta.customSections.contractmetav0)}`,
+      );
+    }
   }
 
   return parts.join("\n");
+}
+
+function renderCustomSectionPreview(entries: unknown[]): string {
+  const preview = JSON.stringify(entries.slice(0, 2));
+  return preview.length > 300
+    ? `${preview.slice(0, 300)}...`
+    : preview;
 }

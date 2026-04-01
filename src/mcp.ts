@@ -194,21 +194,29 @@ function createBaseServer(env: Env) {
               ],
             };
           }
-          return {
-            content: [
-              { type: "text" as const, text: JSON.stringify(entry, null, 2) },
-            ],
-          };
-        }
-
-        // Search by tx_hash across paginated error entries
-        const entry = await findErrorEntryByTxHash(env, tx_hash!);
-        if (entry) {
+          const example = await getExampleTransaction(env, fingerprint);
           return {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify(entry, null, 2),
+                text: JSON.stringify({ entry, example }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // Search by tx_hash across paginated error entries (batched reads)
+        const foundEntry = await findErrorEntryByTxHash(env, tx_hash!);
+        if (foundEntry) {
+          const example = await getExampleTransaction(
+            env,
+            foundEntry.fingerprint,
+          );
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ entry: foundEntry, example }, null, 2),
               },
             ],
           };
@@ -230,6 +238,10 @@ function createBaseServer(env: Env) {
               errorCategory: analysis.errorCategory,
               likelyCause: analysis.likelyCause,
               suggestedFix: analysis.suggestedFix,
+              detailedAnalysis: analysis.detailedAnalysis,
+              evidence: analysis.evidence,
+              relatedCodes: analysis.relatedCodes,
+              debugSteps: analysis.debugSteps,
               confidence: analysis.confidence,
             };
           }
@@ -270,11 +282,9 @@ function createBaseServer(env: Env) {
   // --- Tool: get_error_example ---
   server.tool(
     "get_error_example",
-    "Retrieve the stored example transaction for a deduplicated error fingerprint.",
+    "Retrieve the stored example transaction for a fingerprint, including the raw transaction JSON, the fully decoded transaction context, and the contract metadata snapshot used during analysis.",
     {
-      fingerprint: z
-        .string()
-        .describe("The error fingerprint hash"),
+      fingerprint: z.string().describe("The error fingerprint hash"),
     },
     async ({ fingerprint }) => {
       try {
@@ -284,7 +294,7 @@ function createBaseServer(env: Env) {
             content: [
               {
                 type: "text" as const,
-                text: `No example transaction found for fingerprint ${fingerprint}.`,
+                text: `Example transaction for fingerprint ${fingerprint} not found.`,
               },
             ],
           };
@@ -383,7 +393,7 @@ function createBaseServer(env: Env) {
     async ({ xdr_base64, xdr_type }) => {
       try {
         if (xdr_type) {
-          const decoded = decodeXdrWithType(xdr_base64, xdr_type);
+          const decoded = decodeXdr(xdr_base64, xdr_type);
           if (!decoded) {
             return {
               isError: true,
@@ -399,7 +409,7 @@ function createBaseServer(env: Env) {
             content: [
               {
                 type: "text" as const,
-                text: `## Decoded as ${decoded.type}\n\n\`\`\`json\n${JSON.stringify(decoded.json, null, 2)}\n\`\`\``,
+                text: `## Decoded as ${xdr_type}\n\n\`\`\`json\n${JSON.stringify(decoded, null, 2)}\n\`\`\``,
               },
             ],
           };
