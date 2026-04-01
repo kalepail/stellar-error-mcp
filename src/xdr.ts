@@ -3,6 +3,8 @@
  * Provides rich SEP-51 JSON output from any XDR blob, with type guessing.
  */
 import { initSync, decode, guess } from "@stellar/stellar-xdr-json";
+import { decode_stream } from "@stellar/stellar-xdr-json";
+import { parse, isSafeNumber } from "lossless-json";
 // @ts-ignore — Cloudflare Workers can import .wasm files directly
 import wasmModule from "@stellar/stellar-xdr-json/stellar_xdr_json_bg.wasm";
 
@@ -13,6 +15,14 @@ function ensureInit() {
     initSync(wasmModule);
     initialized = true;
   }
+}
+
+function parseDecodedJson(jsonString: string): unknown {
+  return parse(jsonString, null, {
+    // Laboratory parses into BigInt. We need a JSON-safe representation because
+    // decoded transactions are persisted to R2 and returned through MCP.
+    parseNumber: (value) => (isSafeNumber(value) ? Number(value) : value),
+  });
 }
 
 /**
@@ -41,7 +51,7 @@ export function decodeXdr(
   try {
     if (knownType) {
       const jsonStr = decode(knownType, xdrBase64);
-      return JSON.parse(jsonStr);
+      return parseDecodedJson(jsonStr);
     }
 
     // Auto-guess the type
@@ -66,7 +76,7 @@ export function decodeXdr(
       preferred.find((t) => types.includes(t)) ?? types[0];
 
     const jsonStr = decode(bestType, xdrBase64);
-    return JSON.parse(jsonStr);
+    return parseDecodedJson(jsonStr);
   } catch {
     return null;
   }
@@ -85,7 +95,25 @@ export function decodeXdrWithType(
     if (!type) return null;
 
     const jsonStr = decode(type, xdrBase64);
-    return { type, json: JSON.parse(jsonStr) };
+    return { type, json: parseDecodedJson(jsonStr) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decode a base64 XDR stream into an array of decoded JSON entries.
+ * Useful for WASM custom sections like contractspecv0 that contain repeated XDR items.
+ */
+export function decodeXdrStream(
+  knownType: string,
+  xdrBase64: string,
+): unknown[] | null {
+  ensureInit();
+  try {
+    return decode_stream(knownType, xdrBase64).map((entry) =>
+      parseDecodedJson(entry),
+    );
   } catch {
     return null;
   }

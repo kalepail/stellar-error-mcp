@@ -147,9 +147,13 @@ function createBaseServer(env: Env) {
               ],
             };
           }
+          const example = await getExampleTransaction(env, fingerprint);
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify(entry, null, 2) },
+              {
+                type: "text" as const,
+                text: JSON.stringify({ entry, example }, null, 2),
+              },
             ],
           };
         }
@@ -167,11 +171,15 @@ function createBaseServer(env: Env) {
             Array.isArray(entry.txHashes) &&
             entry.txHashes.includes(tx_hash)
           ) {
+            const example = await getExampleTransaction(
+              env,
+              entry.fingerprint,
+            );
             return {
               content: [
                 {
                   type: "text" as const,
-                  text: JSON.stringify(entry, null, 2),
+                  text: JSON.stringify({ entry, example }, null, 2),
                 },
               ],
             };
@@ -194,6 +202,10 @@ function createBaseServer(env: Env) {
               errorCategory: analysis.errorCategory,
               likelyCause: analysis.likelyCause,
               suggestedFix: analysis.suggestedFix,
+              detailedAnalysis: analysis.detailedAnalysis,
+              evidence: analysis.evidence,
+              relatedCodes: analysis.relatedCodes,
+              debugSteps: analysis.debugSteps,
               confidence: analysis.confidence,
             };
           }
@@ -224,6 +236,51 @@ function createBaseServer(env: Env) {
             {
               type: "text" as const,
               text: `Error retrieving entry: ${message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // --- Tool: get_error_example ---
+  server.tool(
+    "get_error_example",
+    "Retrieve the stored example transaction for a fingerprint, including the raw transaction JSON, the fully decoded transaction context, and the contract metadata snapshot used during analysis.",
+    {
+      fingerprint: z.string().describe("The error fingerprint hash"),
+    },
+    async ({ fingerprint }) => {
+      try {
+        const example = await getExampleTransaction(env, fingerprint);
+        if (!example) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Example transaction for fingerprint ${fingerprint} not found.`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(example, null, 2),
+            },
+          ],
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: `Error retrieving example transaction: ${message}`,
             },
           ],
         };
