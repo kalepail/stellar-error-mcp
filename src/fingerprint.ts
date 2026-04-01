@@ -96,8 +96,10 @@ export async function buildFingerprint(
   const functionName = extractFunctionName(tx.envelopeJson);
   const errorSignatures = extractErrorSignatures(tx.diagnosticEvents);
 
+  // Use primaryContractIds (envelope only) for stable fingerprinting —
+  // the full contractIds set includes auth/diag contracts that vary per user
   const parts = [
-    tx.contractIds.slice().sort().join(","),
+    tx.primaryContractIds.slice().sort().join(","),
     functionName,
     errorSignatures.map((s) => `${s.type}:${s.code}`).join(","),
     tx.resultKind,

@@ -440,6 +440,15 @@ function extractFailedSorobanTransactions(
             "diagnostic_events",
           ]) as unknown[]) ?? [];
 
+        // Primary contracts: only from the envelope invoke_host_function (for fingerprinting)
+        const primaryContractIds: string[] = [];
+        for (const call of invokeCalls) {
+          if (typeof call.contractId === "string" && !primaryContractIds.includes(call.contractId)) {
+            primaryContractIds.push(call.contractId);
+          }
+        }
+
+        // All contracts: envelope + diag + auth + meta (for context/lookup)
         const contractIds = collectContractIds(invokeCalls, diagnosticEvents, processing);
 
         const readout = buildErrorReadout(
@@ -456,6 +465,7 @@ function extractFailedSorobanTransactions(
           ledgerCloseTime: String(ledgerCloseTime),
           resultKind,
           soroban: true,
+          primaryContractIds,
           contractIds,
           operationTypes,
           sorobanOperationTypes,
