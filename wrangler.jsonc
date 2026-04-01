@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "stellar-error-mpc",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-31",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "r2_buckets": [
+    {
+      "binding": "ERRORS_BUCKET",
+      "bucket_name": "stellar-errors"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "CURSOR_KV",
+      "id": "PLACEHOLDER"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "VECTORIZE",
+      "index_name": "stellar-error-fingerprints"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "worker_loaders": [
+    {
+      "binding": "LOADER"
+    }
+  ],
+  "vars": {
+    "STELLAR_ARCHIVE_RPC_ENDPOINT": "https://archive-rpc-pro.lightsail.network",
+    "AI_SEARCH_INSTANCE": "stellar-errors",
+    "AI_MODEL": "@cf/moonshotai/kimi-k2.5"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
