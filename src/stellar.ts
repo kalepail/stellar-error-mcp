@@ -1,4 +1,5 @@
 import type { Env, FailedTransaction, ErrorReadout, ScanResult } from "./types.js";
+import { buildDecodedTransactionContext } from "./transaction.js";
 
 const SOROBAN_OPERATION_KEYS = new Set([
   "invoke_host_function",
@@ -200,90 +201,6 @@ function collectSorobanOperationTypes(txValue: any): string[] {
   );
 }
 
-function collectInvokeContractCalls(txValue: any): any[] {
-  const calls: any[] = [];
-  const operations = getLedgerTransactionOperations(txValue);
-  for (const op of operations) {
-    const invoke = op?.body?.invoke_host_function;
-    if (!invoke) continue;
-    const invokeContract = invoke?.host_function?.invoke_contract;
-    if (!invokeContract) continue;
-
-    const call: Record<string, unknown> = {};
-    if (invokeContract.contract_address)
-      call.contractId = invokeContract.contract_address;
-    if (invokeContract.function_name)
-      call.functionName = invokeContract.function_name;
-    if (invokeContract.args) {
-      call.args = invokeContract.args;
-      call.argCount = Array.isArray(invokeContract.args)
-        ? invokeContract.args.length
-        : 0;
-    }
-    if (invoke.auth) {
-      call.auth = invoke.auth;
-      call.authCount = Array.isArray(invoke.auth) ? invoke.auth.length : 0;
-    }
-    calls.push(call);
-  }
-  return calls;
-}
-
-function collectContractIds(
-  invokeCalls: any[],
-  diagnosticEvents: unknown[],
-  processing: any,
-): string[] {
-  const ids = new Set<string>();
-
-  // 1. Envelope: top-level invoke_host_function targets
-  for (const call of invokeCalls) {
-    if (typeof call.contractId === "string") {
-      ids.add(call.contractId);
-    }
-  }
-
-  // 2. Diagnostic events: cross-contract calls, auth contexts, event emitters
-  collectContractAddressesFromValue(diagnosticEvents, ids);
-
-  // 3. Processing meta: ledger entry changes (contracts read/written during execution)
-  const txApply = processing?.tx_apply_processing?.v4;
-  if (txApply) {
-    // Operation changes (state reads/writes)
-    collectContractAddressesFromValue(txApply.operations, ids);
-  }
-
-  return [...ids];
-}
-
-/**
- * Recursively walk a JSON value and collect all Stellar contract addresses (C..., 56 chars).
- * Contract IDs appear in: contract_id, contract_address, contract fields,
- * and nested inside address ScVal types.
- */
-function collectContractAddressesFromValue(
-  obj: unknown,
-  ids: Set<string>,
-): void {
-  if (typeof obj === "string") {
-    if (obj.length === 56 && obj.startsWith("C") && /^[A-Z2-7]+$/.test(obj)) {
-      ids.add(obj);
-    }
-    return;
-  }
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      collectContractAddressesFromValue(item, ids);
-    }
-    return;
-  }
-  if (obj && typeof obj === "object") {
-    for (const v of Object.values(obj as Record<string, unknown>)) {
-      collectContractAddressesFromValue(v, ids);
-    }
-  }
-}
-
 function getNestedValue(value: unknown, path: string[]): unknown {
   let current: unknown = value;
   for (const key of path) {
@@ -429,33 +346,35 @@ function extractFailedSorobanTransactions(
         if (!resultKind || SUCCESS_KINDS.has(resultKind)) continue;
         if (!isSorobanLedgerTransaction(txEntry, processing)) continue;
 
+        const decoded = buildDecodedTransactionContext(txEntry, processing);
         const operationTypes = collectOperationTypes(txEntry);
         const sorobanOperationTypes = collectSorobanOperationTypes(txEntry);
-        const invokeCalls = collectInvokeContractCalls(txEntry);
-
-        const diagnosticEvents: unknown[] =
-          (getNestedValue(processing, [
-            "tx_apply_processing",
-            "v4",
-            "diagnostic_events",
-          ]) as unknown[]) ?? [];
-
-        // Primary contracts: only from the envelope invoke_host_function (for fingerprinting)
-        const primaryContractIds: string[] = [];
-        for (const call of invokeCalls) {
-          if (typeof call.contractId === "string" && !primaryContractIds.includes(call.contractId)) {
-            primaryContractIds.push(call.contractId);
-          }
-        }
+        // Primary contracts: only from the envelope invoke calls (for fingerprinting)
+        const primaryContractIds = [
+          ...new Set(
+            decoded.invokeCalls
+              .map((call) =>
+                typeof call.contractId === "string" ? call.contractId : null,
+              )
+              .filter((value): value is string => value !== null && value.length > 0),
+          ),
+        ];
 
         // All contracts: envelope + diag + auth + meta (for context/lookup)
-        const contractIds = collectContractIds(invokeCalls, diagnosticEvents, processing);
+        const contractIds = [
+          ...new Set(
+            [
+              ...primaryContractIds,
+              ...decoded.touchedContractIds,
+            ].filter((value) => value.length > 0),
+          ),
+        ];
 
         const readout = buildErrorReadout(
           txEntry,
           processing,
           resultKind,
-          invokeCalls,
+          decoded.invokeCalls,
           contractIds,
         );
 
@@ -469,9 +388,10 @@ function extractFailedSorobanTransactions(
           contractIds,
           operationTypes,
           sorobanOperationTypes,
-          diagnosticEvents,
+          diagnosticEvents: decoded.diagnosticEvents,
           envelopeJson: txEntry,
           processingJson: processing,
+          decoded,
           readout,
         });
       } catch {

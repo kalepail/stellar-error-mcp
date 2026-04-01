@@ -1,290 +1,160 @@
-import { encode } from "@toon-format/toon";
-import type { Env, FailedTransaction, AnalysisResult } from "./types.js";
-import type { ContractMetadata } from "./contracts.js";
-import {
-  formatScVal,
-  formatInvokeCall,
-  formatAuthEntry,
-  buildCallStack,
-  renderCallStack,
-  extractStateChanges,
-} from "./format.js";
+import type {
+  AnalysisResult,
+  ContractMetadata,
+  Env,
+  FailedTransaction,
+} from "./types.js";
+import { encode as encodeToon } from "@toon-format/toon";
 
-const SYSTEM_PROMPT = `You are an expert at analyzing failed Stellar/Soroban smart contract transactions. You will receive comprehensive data about a failed transaction including the function called, its arguments, authorization entries, resource limits, diagnostic events, contract specifications with error code definitions, and transaction results.
+const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed Soroban smart contract transaction on the Stellar network.
 
-The transaction data is provided in TOON format (compact structured notation with 2-space indentation, arrays show length and field names). The execution trace uses indented arrows: -> for calls, <- for returns, !! for errors.
+Analyze the failure and respond with a JSON object containing exactly these fields:
+- "summary": A concise 1-2 sentence description of what went wrong
+- "errorCategory": A short machine-friendly classification derived from the observed failure. DO NOT use a fixed enum. Prefer the most specific real label available from the evidence, such as a contract-defined error name, a HostError family/code, an operation result code, or a tx result code. Examples: "contract:Error::InsufficientBalance", "host:Auth.InvalidAction", "op:INVOKE_HOST_FUNCTION_TRAPPED", "tx:txSOROBAN_INVALID"
+- "likelyCause": The most probable root cause of the failure
+- "suggestedFix": A concrete next debugging step or fix suggestion
+- "detailedAnalysis": 1-3 short paragraphs explaining the failure path, what evidence supports the diagnosis, and how the developer should reason about it
+- "evidence": An array of 2-5 specific observations pulled from the transaction data, diagnostic events, resource usage, or contract spec
+- "relatedCodes": An array of concrete codes or identifiers mentioned in the failure, such as tx codes, op codes, HostError labels, auth errors, or contract enum names
+- "debugSteps": An array of 2-5 concrete debugging or remediation steps ordered by usefulness
+- "confidence": "high", "medium", or "low" based on how much diagnostic info was available
 
-Your job is to determine exactly what went wrong and provide actionable guidance. Respond with a JSON object containing exactly these fields:
-- "summary": 1-2 sentences describing what failed and why. Be specific — name the function, the error code and its meaning, and what triggered it. Avoid vague language.
-- "errorCategory": One of: "ContractTrapped", "InsufficientBalance", "AuthorizationFailed", "ResourceExhaustion", "InvalidArguments", "ContractNotFound", "SequenceError", "TimeBoundsExceeded", "InternalError", "Other"
-- "likelyCause": The most probable root cause. Reference specific values from the data — e.g. "amount was 0 but plant() requires > 0", "signature expired at ledger 61922247 but tx landed at 61922248", "CPU instructions budget 500000 was insufficient".
-- "suggestedFix": A concrete, actionable fix. Not "check the parameters" but "pass a non-zero i128 value for the amount parameter" or "increase valid_until_ledger by at least 10 ledgers to account for network latency".
-- "confidence": "high" if error codes and contract spec clearly explain the failure, "medium" if some inference needed, "low" if diagnostic data is sparse.
+Analyze ALL available data:
+- The resultKind (transaction-level failure type)
+- Extracted error signatures: these are normalized from diagnostic events and often expose the HostError family/code or contract error number
+- Function calls: which function was called, with what arguments — check if arguments are invalid (zero amounts, wrong types, out of range)
+- Authorization entries: check signature ledger bounds (valid_until_ledger vs actual ledger), credential types, and auth contexts for sub-contract calls
+- Resource limits: compare CPU instructions, read/write bytes from the envelope against what was consumed — did the tx run out of resources?
+- Diagnostic events: contract error codes, trap messages, function call traces — these show the exact execution path and where it failed
+- Contract events: non-diagnostic events showing what the contract did before failing
+- Transaction result details: the full result XDR showing the precise failure code path
+- Full decoded transaction envelope and processing metadata: use the decoded views to inspect nested XDR blobs, addresses, result codes, contract data, and auth structures that may still be opaque in the raw JSON
+- Operation-level effects and ledger changes: reason through which operation touched which contracts or ledger entries, and what state changed before the failure surfaced
+- Contract specifications (if provided): use error enum definitions to map error codes to their actual names, and function signatures to understand parameter types and expected inputs
+- The readout summary fields for fee and resource overview
 
-Analysis priorities:
-1. The sorobanError opResult code (e.g. invoke_host_function_trapped) — this is the most authoritative failure indicator
-2. Contract error codes + error enum definitions → map code numbers to named errors (e.g. error 8 = PailExists)
-3. The execution trace: follow the call chain (-> arrows), identify where the error (!! markers) occurred, and check return values (<- arrows) for Error(...) patterns
-4. Return value: for failed calls, this often contains the exact contract error code (e.g. Error(contract: 8))
-5. Function signature + arguments → check if inputs violate contract constraints
-6. Authorization entries → check signature ledger bounds and credential validity
-7. Resource limits vs consumed → identify resource exhaustion
-8. State changes: what ledger entries were read/created/updated — helps identify missing or expired data
-9. Contract specifications (if provided): map numeric error codes to their named variants and doc comments, check function signatures for expected parameter types`;
+Rules:
+- Do not invent a closed taxonomy of Soroban errors. Errors are open-ended and may come from protocol validation, host execution, auth, resources, storage, contract-defined enums, or Wasm traps.
+- When contract specs expose enum cases, map numeric contract errors to those names and prefer that mapping in "errorCategory" and "relatedCodes".
+- If evidence is weak or ambiguous, say so in "detailedAnalysis" and lower confidence instead of overfitting.
+- Keep "summary", "likelyCause", and "suggestedFix" concise, but make "detailedAnalysis" and "debugSteps" genuinely useful to a developer.`;
 
 function buildUserPrompt(
   tx: FailedTransaction,
-  contractContext?: string,
+  contracts?: Map<string, ContractMetadata>,
 ): string {
-  // --- Build structured data object for TOON encoding ---
-  const additionalContracts = tx.contractIds.filter(
-    (id) => !tx.primaryContractIds.includes(id),
-  );
-  const data: Record<string, unknown> = {
-    txHash: tx.txHash,
-    resultKind: tx.resultKind,
-    ledger: tx.ledgerSequence,
-    ledgerCloseTime: tx.ledgerCloseTime,
-    operationTypes: tx.operationTypes,
-    sorobanOperations: tx.sorobanOperationTypes,
-    primaryContractIds: tx.primaryContractIds.length > 0 ? tx.primaryContractIds : "none",
-    ...(additionalContracts.length > 0 ? { relatedContracts: additionalContracts } : {}),
-  };
-
-  // --- Soroban-specific error (most authoritative) ---
-  const sorobanError = extractSorobanResultError(tx.processingJson);
-  if (sorobanError) {
-    data.sorobanError = {
-      opResult: sorobanError.opResult,
-      ...(sorobanError.hostFunction ? { detail: sorobanError.hostFunction } : {}),
-    };
-  }
-
-  // --- Return value (often contains contract error code) ---
-  if (tx.readout.returnValue !== undefined && tx.readout.returnValue !== null) {
-    data.returnValue = formatScVal(tx.readout.returnValue);
-  }
-
-  // --- Readout summary ---
-  const readout: Record<string, unknown> = {
-    feeBump: tx.readout.feeBump,
-    invokeCallCount: tx.readout.invokeCallCount,
-    contractCount: tx.readout.contractCount,
-  };
-  if (tx.readout.sourceAccount) readout.sourceAccount = tx.readout.sourceAccount;
-  if (tx.readout.feeSourceAccount) readout.feeSourceAccount = tx.readout.feeSourceAccount;
-  if (tx.readout.nonRefundableResourceFeeCharged !== undefined)
-    readout.nonRefundableResourceFee = tx.readout.nonRefundableResourceFeeCharged;
-  if (tx.readout.refundableResourceFeeCharged !== undefined)
-    readout.refundableResourceFee = tx.readout.refundableResourceFeeCharged;
-  if (tx.readout.rentFeeCharged !== undefined)
-    readout.rentFee = tx.readout.rentFeeCharged;
-  data.readout = readout;
-
-  // --- Function calls with ScVal-formatted arguments ---
-  const invokeCalls = extractInvokeCalls(tx.envelopeJson);
-  if (invokeCalls.length > 0) {
-    data.functionCalls = invokeCalls.map((ic) =>
-      formatInvokeCall(ic as Record<string, unknown>),
-    );
-  }
-
-  // --- Auth entries (structured) ---
-  const authEntries = extractAuthEntries(tx.envelopeJson);
-  if (authEntries.length > 0) {
-    data.authEntries = authEntries.map((auth) =>
-      formatAuthEntry(auth as Record<string, unknown>),
-    );
-  }
-
-  // --- Resource limits from envelope ---
-  const resources = extractResourceLimits(tx.envelopeJson);
-  if (resources) {
-    data.resourceLimits = resources;
-  }
-
-  // --- State changes from result meta ---
-  const stateChanges = extractStateChanges(tx.processingJson);
-  if (stateChanges.length > 0) {
-    data.stateChanges = stateChanges.slice(0, 20).map((sc) => sc.summary);
-  }
-
-  // --- Encode structured data as TOON ---
-  let toonData: string;
-  try {
-    toonData = encode(data, { keyFolding: "safe" });
-  } catch {
-    // Fallback to JSON if TOON encoding fails (e.g. circular refs)
-    toonData = JSON.stringify(data, null, 2);
-  }
-
-  const parts: string[] = [];
-
-  parts.push("```toon");
-  parts.push(toonData);
-  parts.push("```");
-
-  // --- Execution trace (call stack from diagnostic events) ---
-  if (tx.diagnosticEvents.length > 0) {
-    const callStack = buildCallStack(tx.diagnosticEvents);
-    const trace = renderCallStack(callStack);
-    if (trace) {
-      parts.push("");
-      parts.push(`Execution Trace (${tx.diagnosticEvents.length} diagnostic events):`);
-      parts.push("```");
-      parts.push(trace);
-      parts.push("```");
-    }
-  }
-
-  // --- Transaction result details (compact) ---
-  const resultDetails = extractResultDetails(tx.processingJson);
-  if (resultDetails) {
-    let resultStr = JSON.stringify(resultDetails);
-    if (resultStr.length > 3000) resultStr = resultStr.slice(0, 3000) + "...";
-    parts.push("");
-    parts.push(`Transaction Result: ${resultStr}`);
-  }
-
-  // --- Contract events (non-diagnostic) ---
-  const contractEvents = extractContractEvents(tx.processingJson);
-  if (contractEvents.length > 0) {
-    const formatted = contractEvents.slice(0, 8).map((evt) => {
-      let s = JSON.stringify(evt);
-      if (s.length > 500) s = s.slice(0, 500) + "...";
-      return s;
-    });
-    parts.push("");
-    parts.push(`Contract Events (${contractEvents.length} total):`);
-    for (const f of formatted) {
-      parts.push(`  ${f}`);
-    }
-  }
-
-  // --- Contract specifications ---
-  if (contractContext) {
-    parts.push("");
-    parts.push(contractContext);
-  }
-
-  // Guard: keep total prompt under ~60K chars (~15K tokens) to leave room for response
-  const MAX_PROMPT_CHARS = 60000;
-  let prompt = parts.join("\n");
-  if (prompt.length > MAX_PROMPT_CHARS) {
-    // Trim from the bottom (contract events and some diagnostic events are least critical)
-    prompt = prompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[... prompt truncated for length]";
-  }
-  return prompt;
-}
-
-// --- Envelope data extraction helpers ---
-
-function extractInvokeCalls(envelope: unknown): any[] {
-  const calls: any[] = [];
-  walkJson(envelope, (key, value) => {
-    if (key === "invoke_contract" && value && typeof value === "object") {
-      calls.push(value);
-    }
+  const aiPayload = compactForAi({
+    transaction: {
+      txHash: tx.txHash,
+      ledgerSequence: tx.ledgerSequence,
+      ledgerCloseTime: tx.ledgerCloseTime,
+      resultKind: tx.resultKind,
+      operationTypes: tx.operationTypes,
+      sorobanOperationTypes: tx.sorobanOperationTypes,
+      contractIds: tx.contractIds,
+      topLevelFunction: tx.decoded.topLevelFunction,
+      readout: tx.readout,
+    },
+    evidence: {
+      errorSignatures: tx.decoded.errorSignatures,
+      invokeCalls: tx.decoded.invokeCalls,
+      authEntries: tx.decoded.authEntries,
+      resourceLimits: tx.decoded.resourceLimits,
+      transactionResult: tx.decoded.transactionResult,
+      diagnosticEvents: tx.decoded.diagnosticEvents,
+      contractEvents: tx.decoded.contractEvents,
+      sorobanMeta: tx.decoded.sorobanMeta,
+      operationEffects: tx.decoded.processingOperations,
+      ledgerChanges: tx.decoded.ledgerChanges,
+      touchedContractIds: tx.decoded.touchedContractIds,
+    },
+    raw: {
+      envelope: tx.envelopeJson,
+      processing: tx.processingJson,
+    },
+    decoded: {
+      envelope: tx.decoded.decodedEnvelope,
+      processing: tx.decoded.decodedProcessing,
+    },
+    contracts: summarizeContracts(contracts),
   });
-  return calls;
+
+  const toon = encodeToon(aiPayload, { keyFolding: "safe" });
+
+  return [
+    "The following document is TOON, a lossless structured encoding of JSON optimized for LLM input.",
+    "Interpret it as structured data. Arrays may use [N] lengths and uniform object arrays may use {field,...} headers.",
+    "```toon",
+    toon,
+    "```",
+  ].join("\n\n");
 }
 
-function extractAuthEntries(envelope: unknown): any[] {
-  const entries: any[] = [];
-  walkJson(envelope, (key, value) => {
-    if (key === "soroban_credentials" && value && typeof value === "object") {
-      entries.push(value);
+function summarizeContracts(
+  contracts?: Map<string, ContractMetadata>,
+): unknown[] {
+  if (!contracts || contracts.size === 0) return [];
+
+  return [...contracts.values()].map((meta) => ({
+    contractId: meta.contractId,
+    wasmHash: meta.wasmHash,
+    functions: meta.functions,
+    errorEnums: meta.errorEnums,
+    structs: meta.structs,
+    customSections: meta.customSections,
+  }));
+}
+
+function compactForAi(value: unknown, depth = 0): unknown {
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === "string") {
+    return value.length > 10000
+      ? `${value.slice(0, 10000)}... [truncated]`
+      : value;
+  }
+  if (typeof value !== "object") return value;
+  if (depth >= 7) return "[max-depth]";
+
+  if (Array.isArray(value)) {
+    const limit = depth <= 1 ? 50 : 30;
+    const items = value
+      .slice(0, limit)
+      .map((item) => compactForAi(item, depth + 1));
+    if (value.length > limit) {
+      items.push({
+        _truncated: true,
+        remainingItems: value.length - limit,
+      });
     }
-  });
-  return entries.slice(0, 5);
-}
-
-function extractResourceLimits(envelope: unknown): Record<string, number> | null {
-  let resources: Record<string, number> | null = null;
-  walkJson(envelope, (key, value) => {
-    if (key === "resources" && value && typeof value === "object") {
-      const r = value as Record<string, unknown>;
-      if ("instructions" in r || "read_bytes" in r) {
-        resources = {};
-        if (r.instructions !== undefined)
-          resources.cpuInstructions = Number(r.instructions);
-        if (r.read_bytes !== undefined)
-          resources.readBytes = Number(r.read_bytes);
-        if (r.write_bytes !== undefined)
-          resources.writeBytes = Number(r.write_bytes);
-        if (r.extended_meta_data_size_bytes !== undefined)
-          resources.extendedMetaSize = Number(r.extended_meta_data_size_bytes);
-      }
-    }
-  });
-  return resources;
-}
-
-function extractResultDetails(processing: unknown): unknown {
-  if (!processing || typeof processing !== "object") return null;
-  const p = processing as Record<string, unknown>;
-  return p.result ?? null;
-}
-
-/**
- * Extract Soroban-specific error codes from the transaction result.
- * The result path is: result.result.tx_failed[].op_inner.invoke_host_function_*
- */
-function extractSorobanResultError(processing: unknown): {
-  opResult: string;
-  hostFunction?: string;
-} | null {
-  if (!processing || typeof processing !== "object") return null;
-  const result = (processing as any)?.result?.result;
-  if (!result) return null;
-
-  const txFailed = result.tx_failed ?? result.tx_fee_bump_inner_failed;
-  if (!Array.isArray(txFailed)) return null;
-
-  for (const opResult of txFailed) {
-    if (!opResult || typeof opResult !== "object") continue;
-    const opInner = opResult.op_inner;
-    if (!opInner || typeof opInner !== "object") continue;
-
-    for (const [key, value] of Object.entries(opInner as Record<string, unknown>)) {
-      if (
-        key.startsWith("invoke_host_function") ||
-        key.startsWith("restore_footprint") ||
-        key.startsWith("extend_footprint_ttl")
-      ) {
-        return {
-          opResult: key,
-          hostFunction: typeof value === "string" ? value : JSON.stringify(value),
-        };
-      }
-    }
+    return items;
   }
 
-  return null;
+  const output: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+    output[key] = compactForAi(inner, depth + 1);
+  }
+  return output;
 }
 
-function extractContractEvents(processing: unknown): any[] {
-  if (!processing || typeof processing !== "object") return [];
-  const events: any[] = [];
-  const v4 = (processing as any)?.tx_apply_processing?.v4;
-  if (v4?.events && Array.isArray(v4.events)) {
-    events.push(...v4.events);
-  }
-  return events;
+function normalizeString(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : fallback;
 }
 
-function walkJson(
-  obj: unknown,
-  callback: (key: string, value: unknown, parent: unknown) => void,
-): void {
-  if (Array.isArray(obj)) {
-    for (const item of obj) walkJson(item, callback);
-  } else if (obj && typeof obj === "object") {
-    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-      callback(k, v, obj);
-      walkJson(v, callback);
-    }
-  }
+function normalizeStringArray(
+  value: unknown,
+  fallback: string[] = [],
+  maxItems = 5,
+): string[] {
+  if (!Array.isArray(value)) return fallback;
+
+  const normalized = value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
+
+  if (normalized.length === 0) return fallback;
+  return normalized.slice(0, maxItems);
 }
 
 const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
@@ -337,7 +207,7 @@ async function runAIWithRetry(
             console.log(
               `Model ${model} failed after ${attempt + 1} attempts, trying fallback...`,
             );
-            break;
+            break; // try next model
           }
           throw error;
         }
@@ -357,14 +227,14 @@ async function runAIWithRetry(
 export async function analyzeFailedTransaction(
   env: Env,
   tx: FailedTransaction,
-  contractContext?: string,
+  contracts?: Map<string, ContractMetadata>,
 ): Promise<AnalysisResult> {
   const modelId = env.AI_MODEL;
 
   try {
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildUserPrompt(tx, contractContext) },
+      { role: "user", content: buildUserPrompt(tx, contracts) },
     ];
 
     const { text, usedModel } = await runAIWithRetry(env, messages, modelId);
@@ -380,10 +250,26 @@ export async function analyzeFailedTransaction(
 
     return {
       txHash: tx.txHash,
-      summary: parsed.summary ?? "Analysis could not produce a summary",
-      errorCategory: parsed.errorCategory ?? "Other",
-      likelyCause: parsed.likelyCause ?? "Unknown",
-      suggestedFix: parsed.suggestedFix ?? "Review diagnostic events manually",
+      summary: normalizeString(
+        parsed.summary,
+        "Analysis could not produce a summary",
+      ),
+      errorCategory: normalizeString(parsed.errorCategory, "unclassified"),
+      likelyCause: normalizeString(parsed.likelyCause, "Unknown"),
+      suggestedFix: normalizeString(
+        parsed.suggestedFix,
+        "Review diagnostic events manually",
+      ),
+      detailedAnalysis: normalizeString(
+        parsed.detailedAnalysis,
+        "The model did not provide a detailed analysis. Review the transaction result, diagnostic events, and contract specification manually.",
+      ),
+      evidence: normalizeStringArray(parsed.evidence),
+      relatedCodes: normalizeStringArray(parsed.relatedCodes),
+      debugSteps: normalizeStringArray(parsed.debugSteps, [
+        "Inspect the transaction result and operation result codes.",
+        "Review diagnostic events and authorization entries for the failing path.",
+      ]),
       confidence: parsed.confidence ?? "low",
       analyzedAt: new Date().toISOString(),
       modelId: usedModel,
@@ -395,9 +281,17 @@ export async function analyzeFailedTransaction(
     return {
       txHash: tx.txHash,
       summary: `AI analysis failed: ${message}`,
-      errorCategory: "Other",
+      errorCategory: "analysis:failed",
       likelyCause: "Analysis error",
       suggestedFix: "Review raw transaction data manually",
+      detailedAnalysis:
+        "The AI analysis request failed before a structured diagnosis could be produced. Use the raw transaction result, diagnostic events, and any contract spec metadata for manual debugging.",
+      evidence: [],
+      relatedCodes: [],
+      debugSteps: [
+        "Review the stored transaction envelope and processing metadata manually.",
+        "Decode the transaction/result XDR and inspect diagnostic events.",
+      ],
       confidence: "failed",
       analyzedAt: new Date().toISOString(),
       modelId,

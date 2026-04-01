@@ -1,4 +1,11 @@
-import type { Env, FailedTransaction, ErrorEntry, AnalysisResult } from "./types.js";
+import type {
+  AnalysisResult,
+  ContractMetadata,
+  Env,
+  ErrorEntry,
+  ExampleTransactionRecord,
+  FailedTransaction,
+} from "./types.js";
 import { buildErrorDescription } from "./fingerprint.js";
 
 const CURSOR_KEY = "last_processed_ledger";
@@ -30,7 +37,8 @@ export async function storeErrorEntry(
       contractIds: entry.contractIds.join(",").slice(0, 200),
       functionName: entry.functionName,
       seenCount: String(entry.seenCount),
-      context: `${entry.summary} Category: ${entry.errorCategory}. Function: ${entry.functionName}`.slice(0, 200),
+      relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
+      context: `${entry.summary} Category: ${entry.errorCategory}. Codes: ${entry.relatedCodes.join(", ")}. Function: ${entry.functionName}`.slice(0, 200),
     },
   });
 }
@@ -61,13 +69,23 @@ export async function storeExampleTransaction(
   env: Env,
   tx: FailedTransaction,
   fingerprint: string,
+  contracts: ContractMetadata[] = [],
 ): Promise<void> {
   const key = `examples/${fingerprint}.json`;
-  await env.ERRORS_BUCKET.put(key, JSON.stringify(tx, null, 2), {
+  const record: ExampleTransactionRecord = {
+    fingerprint,
+    storedAt: new Date().toISOString(),
+    transaction: tx,
+    contracts,
+  };
+
+  await env.ERRORS_BUCKET.put(key, JSON.stringify(record, null, 2), {
     httpMetadata: { contentType: "application/json" },
     customMetadata: {
       fingerprint,
       txHash: tx.txHash,
+      functionName: tx.decoded.topLevelFunction,
+      contractCount: String(contracts.length),
     },
   });
 }
@@ -75,7 +93,7 @@ export async function storeExampleTransaction(
 export async function getExampleTransaction(
   env: Env,
   fingerprint: string,
-): Promise<FailedTransaction | null> {
+): Promise<ExampleTransactionRecord | null> {
   const object = await env.ERRORS_BUCKET.get(`examples/${fingerprint}.json`);
   if (!object) return null;
   return object.json();
