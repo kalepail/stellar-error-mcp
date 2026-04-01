@@ -10,33 +10,36 @@ import {
   extractStateChanges,
 } from "./format.js";
 
-const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed Soroban smart contract transaction on the Stellar network.
+const SYSTEM_PROMPT = `You are an expert at analyzing failed Stellar/Soroban smart contract transactions. You will receive comprehensive data about a failed transaction including the function called, its arguments, authorization entries, resource limits, diagnostic events, contract specifications with error code definitions, and transaction results.
 
 The transaction data is provided in TOON format (compact structured notation with 2-space indentation, arrays show length and field names). The execution trace uses indented arrows: -> for calls, <- for returns, !! for errors.
 
-Analyze the failure and respond with a JSON object containing exactly these fields:
-- "summary": A concise 1-2 sentence description of what went wrong
+Your job is to determine exactly what went wrong and provide actionable guidance. Respond with a JSON object containing exactly these fields:
+- "summary": 1-2 sentences describing what failed and why. Be specific — name the function, the error code and its meaning, and what triggered it. Avoid vague language.
 - "errorCategory": One of: "ContractTrapped", "InsufficientBalance", "AuthorizationFailed", "ResourceExhaustion", "InvalidArguments", "ContractNotFound", "SequenceError", "TimeBoundsExceeded", "InternalError", "Other"
-- "likelyCause": The most probable root cause of the failure
-- "suggestedFix": A concrete next debugging step or fix suggestion
-- "confidence": "high", "medium", or "low" based on how much diagnostic info was available
+- "likelyCause": The most probable root cause. Reference specific values from the data — e.g. "amount was 0 but plant() requires > 0", "signature expired at ledger 61922247 but tx landed at 61922248", "CPU instructions budget 500000 was insufficient".
+- "suggestedFix": A concrete, actionable fix. Not "check the parameters" but "pass a non-zero i128 value for the amount parameter" or "increase valid_until_ledger by at least 10 ledgers to account for network latency".
+- "confidence": "high" if error codes and contract spec clearly explain the failure, "medium" if some inference needed, "low" if diagnostic data is sparse.
 
-Analyze ALL available data:
-- The resultKind (transaction-level failure type)
-- The sorobanError opResult code (e.g. invoke_host_function_trapped) — this is the most authoritative failure indicator
-- The execution trace: follow the call chain (-> arrows), identify where the error (!! markers) occurred, and check return values (<- arrows) for Error(...) patterns
-- Return value: for failed calls, this often contains the exact contract error code (e.g. Error(contract: 8))
-- Function calls and their arguments — check if arguments are invalid (zero amounts, wrong types, out of range values)
-- Authorization entries: check signature expiration ledger vs actual ledger, credential types, and cross-contract call auth
-- Resource limits: compare CPU instructions and read/write bytes from envelope against what was consumed
-- State changes: what ledger entries were read/created/updated — helps identify missing or expired data
-- Contract specifications (if provided): map numeric error codes to their named variants and doc comments, check function signatures for expected parameter types`;
+Analysis priorities:
+1. The sorobanError opResult code (e.g. invoke_host_function_trapped) — this is the most authoritative failure indicator
+2. Contract error codes + error enum definitions → map code numbers to named errors (e.g. error 8 = PailExists)
+3. The execution trace: follow the call chain (-> arrows), identify where the error (!! markers) occurred, and check return values (<- arrows) for Error(...) patterns
+4. Return value: for failed calls, this often contains the exact contract error code (e.g. Error(contract: 8))
+5. Function signature + arguments → check if inputs violate contract constraints
+6. Authorization entries → check signature ledger bounds and credential validity
+7. Resource limits vs consumed → identify resource exhaustion
+8. State changes: what ledger entries were read/created/updated — helps identify missing or expired data
+9. Contract specifications (if provided): map numeric error codes to their named variants and doc comments, check function signatures for expected parameter types`;
 
 function buildUserPrompt(
   tx: FailedTransaction,
   contractContext?: string,
 ): string {
   // --- Build structured data object for TOON encoding ---
+  const additionalContracts = tx.contractIds.filter(
+    (id) => !tx.primaryContractIds.includes(id),
+  );
   const data: Record<string, unknown> = {
     txHash: tx.txHash,
     resultKind: tx.resultKind,
@@ -44,7 +47,8 @@ function buildUserPrompt(
     ledgerCloseTime: tx.ledgerCloseTime,
     operationTypes: tx.operationTypes,
     sorobanOperations: tx.sorobanOperationTypes,
-    contractIds: tx.contractIds.length > 0 ? tx.contractIds : "none",
+    primaryContractIds: tx.primaryContractIds.length > 0 ? tx.primaryContractIds : "none",
+    ...(additionalContracts.length > 0 ? { relatedContracts: additionalContracts } : {}),
   };
 
   // --- Soroban-specific error (most authoritative) ---
@@ -163,7 +167,14 @@ function buildUserPrompt(
     parts.push(contractContext);
   }
 
-  return parts.join("\n");
+  // Guard: keep total prompt under ~60K chars (~15K tokens) to leave room for response
+  const MAX_PROMPT_CHARS = 60000;
+  let prompt = parts.join("\n");
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    // Trim from the bottom (contract events and some diagnostic events are least critical)
+    prompt = prompt.slice(0, MAX_PROMPT_CHARS) + "\n\n[... prompt truncated for length]";
+  }
+  return prompt;
 }
 
 // --- Envelope data extraction helpers ---

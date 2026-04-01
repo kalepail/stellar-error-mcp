@@ -16,6 +16,9 @@ export interface FailedTransaction {
   ledgerCloseTime: string;
   resultKind: string;
   soroban: true;
+  /** Primary contracts from the invoke_host_function envelope — used for fingerprinting */
+  primaryContractIds: string[];
+  /** All contracts discovered from envelope + diag + auth + meta — used for context/lookup */
   contractIds: string[];
   operationTypes: string[];
   sorobanOperationTypes: string[];
