@@ -33,6 +33,7 @@ interface ProcessOptions {
   maxLedgers?: number;
   startOverride?: number;
   maxFailed?: number;
+  skipCursorUpdate?: boolean;
 }
 
 function formatError(error: unknown): string {
@@ -288,7 +289,9 @@ async function processNewLedgers(
     });
   }
 
-  await setLastProcessedLedger(env, scanResult.lastLedgerProcessed);
+  if (!opts.skipCursorUpdate) {
+    await setLastProcessedLedger(env, scanResult.lastLedgerProcessed);
+  }
 
   logInfo("scan.cycle_complete", {
     newErrors,
@@ -393,6 +396,7 @@ export default {
                   startOverride: cursor,
                   maxLedgers: chunkLedgers,
                   maxFailed: 100,
+                  skipCursorUpdate: true,
                 });
               } catch (error) {
                 const msg = formatError(error);

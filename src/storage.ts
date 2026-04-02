@@ -139,7 +139,6 @@ export function normalizeErrorEntry(
   );
 
   if (
-    contractIds.length === 0 ||
     txHashes.length === 0 ||
     !Array.isArray(raw.errorSignatures) ||
     !Array.isArray(raw.sorobanOperationTypes) ||
