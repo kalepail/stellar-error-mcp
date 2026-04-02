@@ -67,15 +67,40 @@ export class MemoryR2Bucket {
   }
 }
 
+export class MemoryKV {
+  readonly store = new Map<string, string>();
+  readonly getCalls: string[] = [];
+  readonly putCalls: Array<{ key: string; value: string }> = [];
+
+  async get(key: string): Promise<string | null> {
+    this.getCalls.push(key);
+    return this.store.get(key) ?? null;
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    this.putCalls.push({ key, value });
+    this.store.set(key, value);
+  }
+
+  async list(options: { prefix?: string; limit?: number } = {}): Promise<{ keys: { name: string }[] }> {
+    const prefix = options.prefix ?? "";
+    const limit = options.limit ?? 1000;
+    const keys = [...this.store.keys()]
+      .filter((k) => k.startsWith(prefix))
+      .sort()
+      .slice(0, limit)
+      .map((name) => ({ name }));
+    return { keys };
+  }
+}
+
 export function createTestEnv(
   bucket = new MemoryR2Bucket(),
-): Env & { ERRORS_BUCKET: MemoryR2Bucket } {
+  kv = new MemoryKV(),
+): Env & { ERRORS_BUCKET: MemoryR2Bucket; CURSOR_KV: MemoryKV } {
   return {
     ERRORS_BUCKET: bucket,
-    CURSOR_KV: {
-      get: async () => null,
-      put: async () => undefined,
-    } as KVNamespace,
+    CURSOR_KV: kv as unknown as KVNamespace,
     VECTORIZE: {
       query: async () => ({ count: 0, matches: [] }),
       upsert: async () => undefined,
