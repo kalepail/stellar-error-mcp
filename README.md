@@ -9,7 +9,7 @@ A Cloudflare Worker that continuously scans the Stellar blockchain for failed So
 3. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
 4. **Decode and enrich** — Each failed transaction is normalized into a first-class decoded artifact containing the raw envelope/processing JSON, recursively XDR-decoded views, invoke/auth/resource summaries, operation-level effects, ledger changes, and touched contract IDs.
 5. **Analyze** — Unique errors are sent to a Cloudflare AI model with the full enriched transaction plus contract specs and decoded WASM custom sections, encoded as TOON for high-fidelity LLM input. The model returns a structured analysis: summary, evidence-based classification, likely cause, suggested fix, related codes, debug steps, detailed analysis, and confidence level.
-6. **Store** — Error entries, enriched example transactions, and contract metadata snapshots are persisted to R2. Vectors are indexed in Vectorize. Documents are indexed in AI Search.
+6. **Store** — Canonical error entries, example transactions, tx-hash pointers, and contract metadata snapshots are persisted to R2. Each error also emits a curated Markdown document under `search-docs/` for AI Search indexing. Vectors are indexed in Vectorize for ingest-time semantic dedup.
 7. **Serve** — An MCP server exposes tools (`diagnose_error`, `get_error`, `get_error_example`, `decode_xdr`) so AI agents can query the knowledge base with natural language or raw XDR blobs.
 
 ## Prerequisites
@@ -27,7 +27,7 @@ Create these before deploying:
 | R2 Bucket | `stellar-errors` |
 | KV Namespace | any — put the ID in `wrangler.jsonc` |
 | Vectorize Index | `stellar-error-fingerprints` (model: `@cf/baai/bge-base-en-v1.5`) |
-| AI Search | `stellar-errors` |
+| AI Search | `stellar-errors` (R2-backed, scoped to `/search-docs/**`) |
 
 ## Setup
 
@@ -48,6 +48,18 @@ For deployed admin endpoints, also set a management token secret:
 ```bash
 wrangler secret put MANAGEMENT_TOKEN
 ```
+
+Provision or update the AI Search instance from code instead of the dashboard:
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID=...
+export CLOUDFLARE_AI_SEARCH_TOKEN_ID=...
+npm run provision:ai-search
+```
+
+If you are already logged in with `wrangler login`, the script will automatically reuse the active Wrangler auth token. Set `CLOUDFLARE_AI_SEARCH_API_TOKEN` only if you want to override that behavior.
+
+If you do not already have an AI Search token registered, provide `CLOUDFLARE_SERVICE_API_ID` and `CLOUDFLARE_SERVICE_API_KEY` instead of `CLOUDFLARE_AI_SEARCH_TOKEN_ID`. Those credentials come from the service-token flow documented in Cloudflare's AI Search API setup.
 
 ## Development
 
@@ -90,7 +102,7 @@ npm run deploy
 
 **`decode_xdr`** — Decode arbitrary base64 XDR blobs into rich JSON with automatic type guessing.
 
-**`search_errors`** — Return raw matching AI Search chunks without synthesized analysis.
+**`search_errors`** — Return raw matching AI Search chunks without synthesized analysis. Supports metadata filters aligned with the `search-docs/` schema.
 
 **`list_errors`** — List stored error/example objects in R2.
 
@@ -103,6 +115,7 @@ src/
   transaction.ts    Shared transaction decoding and normalization helpers
   analysis.ts       AI analysis prompts and model calls
   fingerprint.ts    SHA-256 fingerprinting, error signature extraction
+  ai-search.ts      AI Search document generation, metadata schema, and filters
   storage.ts        R2 / KV / Vectorize operations
   contracts.ts      On-chain contract spec and WASM custom section fetching/caching
   mcp.ts            MCP server and tool definitions
@@ -119,4 +132,11 @@ Key constants in `src/index.ts`:
 | `MAX_LEDGERS_PER_CYCLE` | 200 | Ledgers processed per cron trigger |
 | `COLD_START_LOOKBACK` | 50 | Ledgers to look back on first run |
 
-AI model and RPC endpoint are configured in `wrangler.jsonc` under `vars`.
+AI Search and analysis models are configured separately in `wrangler.jsonc` under `vars`.
+
+## R2 layout
+
+- `errors/<fingerprint>.json`: canonical structured error records
+- `examples/<fingerprint>.json`: stored example transactions and contract snapshots
+- `tx-index/<txHash>.json`: direct tx-hash to fingerprint pointers
+- `search-docs/<fingerprint>.md`: the only documents intended for AI Search indexing

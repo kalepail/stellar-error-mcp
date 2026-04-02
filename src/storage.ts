@@ -1,16 +1,189 @@
 import type {
-  AnalysisResult,
   ContractMetadata,
   Env,
   ErrorEntry,
+  ErrorReadout,
   ExampleTransactionRecord,
   FailedTransaction,
 } from "./types.js";
+import { buildSearchDocument } from "./ai-search.js";
 
 const CURSOR_KEY = "last_processed_ledger";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
 const MAX_TX_HASHES_PER_ENTRY = 50;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string =>
+    typeof item === "string" && item.length > 0
+  );
+}
+
+function normalizeConfidence(
+  value: unknown,
+): ErrorEntry["confidence"] {
+  return value === "high" ||
+      value === "medium" ||
+      value === "low" ||
+      value === "failed"
+    ? value
+    : "low";
+}
+
+function normalizeErrorReadout(
+  value: unknown,
+  resultKind: string,
+  contractCount: number,
+): ErrorReadout | null {
+  if (!isRecord(value)) return null;
+
+  return {
+    resultKind: normalizeString(value.resultKind, resultKind),
+    feeBump: value.feeBump === true,
+    invokeCallCount: typeof value.invokeCallCount === "number"
+      ? value.invokeCallCount
+      : 0,
+    contractCount: typeof value.contractCount === "number"
+      ? value.contractCount
+      : contractCount,
+    sourceAccount: typeof value.sourceAccount === "string"
+      ? value.sourceAccount
+      : undefined,
+    feeSourceAccount: typeof value.feeSourceAccount === "string"
+      ? value.feeSourceAccount
+      : undefined,
+    hasSorobanMeta: value.hasSorobanMeta === true,
+    hasEvents: value.hasEvents === true,
+    hasDiagnosticEvents: value.hasDiagnosticEvents === true,
+    eventCount: typeof value.eventCount === "number"
+      ? value.eventCount
+      : undefined,
+    diagnosticEventCount: typeof value.diagnosticEventCount === "number"
+      ? value.diagnosticEventCount
+      : undefined,
+    returnValue: value.returnValue,
+    nonRefundableResourceFeeCharged:
+      typeof value.nonRefundableResourceFeeCharged === "number"
+        ? value.nonRefundableResourceFeeCharged
+        : undefined,
+    refundableResourceFeeCharged:
+      typeof value.refundableResourceFeeCharged === "number"
+        ? value.refundableResourceFeeCharged
+        : undefined,
+    rentFeeCharged:
+      typeof value.rentFeeCharged === "number"
+        ? value.rentFeeCharged
+        : undefined,
+  };
+}
+
+export function normalizeErrorEntry(
+  raw: unknown,
+): ErrorEntry | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+
+  const fingerprint = normalizeString(raw.fingerprint);
+  const summary = normalizeString(raw.summary);
+  const errorCategory = normalizeString(raw.errorCategory);
+  const functionName = normalizeString(raw.functionName);
+  const seenCount = typeof raw.seenCount === "number" && Number.isFinite(raw.seenCount)
+    ? raw.seenCount
+    : null;
+  const firstSeen = normalizeString(raw.firstSeen);
+  const lastSeen = normalizeString(raw.lastSeen);
+  const likelyCause = normalizeString(raw.likelyCause);
+  const suggestedFix = normalizeString(raw.suggestedFix);
+  const detailedAnalysis = normalizeString(raw.detailedAnalysis);
+  const modelId = normalizeString(raw.modelId);
+  const exampleTxHash = normalizeString(raw.exampleTxHash);
+  const resultKind = normalizeString(raw.resultKind);
+
+  if (
+    !fingerprint ||
+    !summary ||
+    !errorCategory ||
+    !functionName ||
+    seenCount === null ||
+    !firstSeen ||
+    !lastSeen ||
+    !likelyCause ||
+    !suggestedFix ||
+    !detailedAnalysis ||
+    !modelId ||
+    !exampleTxHash ||
+    !resultKind
+  ) {
+    return null;
+  }
+
+  const contractIds = normalizeStringArray(raw.contractIds);
+  const txHashes = normalizeStringArray(raw.txHashes);
+  const evidence = normalizeStringArray(raw.evidence);
+  const relatedCodes = normalizeStringArray(raw.relatedCodes);
+  const debugSteps = normalizeStringArray(raw.debugSteps);
+  const exampleReadout = normalizeErrorReadout(
+    raw.exampleReadout,
+    resultKind,
+    contractIds.length,
+  );
+
+  if (
+    txHashes.length === 0 ||
+    !Array.isArray(raw.errorSignatures) ||
+    !Array.isArray(raw.sorobanOperationTypes) ||
+    !exampleReadout
+  ) {
+    return null;
+  }
+
+  return {
+    fingerprint,
+    contractIds,
+    functionName,
+    errorSignatures: Array.isArray(raw.errorSignatures)
+      ? raw.errorSignatures
+        .filter((item): item is { type: string; code: string } =>
+          isRecord(item) &&
+          typeof item.type === "string" &&
+          typeof item.code === "string"
+        )
+        .map((item) => ({ type: item.type, code: item.code }))
+      : [],
+    resultKind,
+    sorobanOperationTypes: normalizeStringArray(raw.sorobanOperationTypes),
+    summary,
+    errorCategory,
+    likelyCause,
+    suggestedFix,
+    detailedAnalysis,
+    evidence,
+    relatedCodes,
+    debugSteps,
+    confidence: normalizeConfidence(raw.confidence),
+    modelId,
+    seenCount,
+    txHashes: [...new Set(txHashes)].slice(-MAX_TX_HASHES_PER_ENTRY),
+    firstSeen,
+    lastSeen,
+    similarTo: typeof raw.similarTo === "string" ? raw.similarTo : undefined,
+    exampleTxHash,
+    exampleReadout,
+    contractContext: typeof raw.contractContext === "string"
+      ? raw.contractContext
+      : undefined,
+  };
+}
 
 // --- Error Entry (fingerprint-based, deduplicated) ---
 
@@ -20,27 +193,50 @@ export async function getErrorEntry(
 ): Promise<ErrorEntry | null> {
   const object = await env.ERRORS_BUCKET.get(`errors/${fingerprint}.json`);
   if (!object) return null;
-  return object.json();
+  const raw = await object.json();
+  return normalizeErrorEntry(raw);
+}
+
+export async function storeSearchDocument(
+  env: Env,
+  entry: ErrorEntry,
+): Promise<void> {
+  const document = buildSearchDocument(entry);
+  const metadata: Record<string, string> = {
+    fingerprint: document.metadata.fingerprint,
+    error_category: document.metadata.error_category,
+    function_name: document.metadata.function_name,
+    primary_contract: document.metadata.primary_contract,
+    operation_type: document.metadata.operation_type,
+  };
+  await env.ERRORS_BUCKET.put(document.key, document.content, {
+    httpMetadata: { contentType: "text/markdown" },
+    customMetadata: metadata,
+  });
 }
 
 export async function storeErrorEntry(
   env: Env,
   entry: ErrorEntry,
 ): Promise<void> {
-  const key = `errors/${entry.fingerprint}.json`;
-  await env.ERRORS_BUCKET.put(key, JSON.stringify(entry, null, 2), {
+  const normalized = normalizeErrorEntry(entry);
+  if (!normalized) return;
+
+  const key = `errors/${normalized.fingerprint}.json`;
+  await env.ERRORS_BUCKET.put(key, JSON.stringify(normalized, null, 2), {
     httpMetadata: { contentType: "application/json" },
     customMetadata: {
-      fingerprint: entry.fingerprint,
-      errorCategory: entry.errorCategory,
-      confidence: entry.confidence,
-      contractIds: entry.contractIds.join(",").slice(0, 200),
-      functionName: entry.functionName,
-      seenCount: String(entry.seenCount),
-      relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
-      context: `${entry.summary} Category: ${entry.errorCategory}. Codes: ${entry.relatedCodes.join(", ")}. Function: ${entry.functionName}`.slice(0, 200),
+      fingerprint: normalized.fingerprint,
+      errorCategory: normalized.errorCategory,
+      confidence: normalized.confidence,
+      contractIds: normalized.contractIds.join(",").slice(0, 200),
+      functionName: normalized.functionName,
+      seenCount: String(normalized.seenCount),
+      relatedCodes: normalized.relatedCodes.join(",").slice(0, 200),
+      context: `${normalized.summary} Category: ${normalized.errorCategory}. Codes: ${normalized.relatedCodes.join(", ")}. Function: ${normalized.functionName}`.slice(0, 200),
     },
   });
+  await storeSearchDocument(env, normalized);
 }
 
 /**
@@ -53,11 +249,54 @@ export async function bumpErrorEntry(
   txHash: string,
   ledgerCloseTime: string,
 ): Promise<void> {
-  entry.seenCount += 1;
-  entry.txHashes = [...entry.txHashes.filter((h) => h !== txHash), txHash]
+  const normalized = normalizeErrorEntry(entry);
+  if (!normalized) return;
+
+  normalized.seenCount += 1;
+  normalized.txHashes = [...normalized.txHashes.filter((h) => h !== txHash), txHash]
     .slice(-MAX_TX_HASHES_PER_ENTRY);
-  entry.lastSeen = ledgerCloseTime;
-  await storeErrorEntry(env, entry);
+  normalized.lastSeen = ledgerCloseTime;
+  await storeErrorEntry(env, normalized);
+  await storeTxHashPointer(env, txHash, normalized.fingerprint);
+}
+
+export async function storeTxHashPointer(
+  env: Env,
+  txHash: string,
+  fingerprint: string,
+): Promise<void> {
+  await env.ERRORS_BUCKET.put(
+    `tx-index/${txHash}.json`,
+    JSON.stringify({ fingerprint }, null, 2),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { txHash, fingerprint },
+    },
+  );
+}
+
+export async function getFingerprintByTxHash(
+  env: Env,
+  txHash: string,
+): Promise<string | null> {
+  const object = await env.ERRORS_BUCKET.get(`tx-index/${txHash}.json`);
+  if (!object) return null;
+
+  const raw = await object.json();
+  if (!isRecord(raw) || typeof raw.fingerprint !== "string" || raw.fingerprint.length === 0) {
+    return null;
+  }
+
+  return raw.fingerprint;
+}
+
+export async function findErrorEntryByTxHash(
+  env: Env,
+  txHash: string,
+): Promise<ErrorEntry | null> {
+  const indexedFingerprint = await getFingerprintByTxHash(env, txHash);
+  if (!indexedFingerprint) return null;
+  return getErrorEntry(env, indexedFingerprint);
 }
 
 // --- Raw transaction storage (one per fingerprint, as reference example) ---
@@ -157,28 +396,6 @@ export async function indexErrorVector(
   ]);
 }
 
-// --- Backward-compatible accessors for MCP tools ---
-
-export async function getRawTransaction(
-  env: Env,
-  txHash: string,
-): Promise<FailedTransaction | null> {
-  // Check legacy raw/ path first, then search error entries by txHash
-  const legacy = await env.ERRORS_BUCKET.get(`raw/${txHash}.json`);
-  if (legacy) return legacy.json();
-  return null;
-}
-
-export async function getAnalysis(
-  env: Env,
-  txHash: string,
-): Promise<AnalysisResult | null> {
-  // Check legacy analysis/ path
-  const legacy = await env.ERRORS_BUCKET.get(`analysis/${txHash}.json`);
-  if (legacy) return legacy.json();
-  return null;
-}
-
 // --- KV Cursor ---
 
 export async function getLastProcessedLedger(
@@ -195,4 +412,8 @@ export async function setLastProcessedLedger(
   sequence: number,
 ): Promise<void> {
   await env.CURSOR_KV.put(CURSOR_KEY, String(sequence));
+}
+
+export function resetStorageStateForTests(): void {
+  // No-op placeholder for test parity.
 }

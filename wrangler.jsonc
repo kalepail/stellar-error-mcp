@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "stellar-error-mcp",
   "main": "src/index.ts",
-  "compatibility_date": "2026-03-31",
+  "compatibility_date": "2026-04-02",
   "compatibility_flags": ["nodejs_compat"],
   "triggers": {
     "crons": ["*/5 * * * *"]
@@ -28,17 +28,20 @@
   "ai": {
     "binding": "AI"
   },
-  "worker_loaders": [
-    {
-      "binding": "LOADER"
-    }
-  ],
   "vars": {
     "STELLAR_ARCHIVE_RPC_ENDPOINT": "https://archive-rpc-pro.lightsail.network",
     "AI_SEARCH_INSTANCE": "stellar-errors",
-    "AI_MODEL": "@cf/moonshotai/kimi-k2.5"
+    "AI_SEARCH_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "AI_ANALYSIS_MODEL": "@cf/moonshotai/kimi-k2.5"
   },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "logs": {
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 0.05
+    }
   }
 }

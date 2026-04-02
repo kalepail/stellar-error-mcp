@@ -1,63 +1,14 @@
 import { createMcpHandler } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { DynamicWorkerExecutor } from "@cloudflare/codemode";
-import { codeMcpServer } from "@cloudflare/codemode/mcp";
 import type { Env } from "./types.js";
 import {
   getErrorEntry,
   getExampleTransaction,
-  getRawTransaction,
-  getAnalysis,
+  findErrorEntryByTxHash,
 } from "./storage.js";
+import { buildAiSearchFilters } from "./ai-search.js";
 import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
-
-const FIND_TX_HASH_CONCURRENCY = 10;
-
-async function findErrorEntryByTxHash(
-  env: Env,
-  txHash: string,
-) {
-  let cursor: string | undefined;
-
-  do {
-    const listed = await env.ERRORS_BUCKET.list({
-      prefix: "errors/",
-      limit: 1000,
-      cursor,
-    });
-
-    // Process in batches with concurrency cap
-    for (let i = 0; i < listed.objects.length; i += FIND_TX_HASH_CONCURRENCY) {
-      const batch = listed.objects.slice(i, i + FIND_TX_HASH_CONCURRENCY);
-      const results = await Promise.all(
-        batch.map(async (obj) => {
-          const data = await env.ERRORS_BUCKET.get(obj.key);
-          if (!data) return null;
-          try {
-            const entry = await data.json() as any;
-            if (
-              entry &&
-              Array.isArray(entry.txHashes) &&
-              entry.txHashes.includes(txHash)
-            ) {
-              return entry;
-            }
-          } catch {
-            // skip malformed entries
-          }
-          return null;
-        }),
-      );
-      const found = results.find((r) => r !== null);
-      if (found) return found;
-    }
-
-    cursor = listed.truncated ? listed.cursor : undefined;
-  } while (cursor);
-
-  return null;
-}
 
 function createBaseServer(env: Env) {
   const server = new McpServer({
@@ -101,16 +52,11 @@ function createBaseServer(env: Env) {
           }
         }
 
-        const queryParts = [queryText];
-        if (contract_id) queryParts.push(`contract: ${contract_id}`);
-        if (operation_type) queryParts.push(`operation: ${operation_type}`);
-        const query = queryParts.join(" ");
-
         const answer = await (env.AI as any)
           .autorag(env.AI_SEARCH_INSTANCE)
           .aiSearch({
-            query,
-            model: env.AI_MODEL,
+            query: queryText,
+            model: env.AI_SEARCH_MODEL,
             rewrite_query: true,
             max_num_results: 5,
             ranking_options: { score_threshold: 0.3 },
@@ -118,6 +64,10 @@ function createBaseServer(env: Env) {
               enabled: true,
               model: "@cf/baai/bge-reranker-base",
             },
+            filters: buildAiSearchFilters({
+              contractId: contract_id,
+              operationType: operation_type,
+            }),
           });
 
         const response = answer.response ?? "No matching errors found.";
@@ -222,39 +172,6 @@ function createBaseServer(env: Env) {
           };
         }
 
-        // Fall back to legacy raw/ storage
-        const raw = await getRawTransaction(env, tx_hash!);
-        const analysis = await getAnalysis(env, tx_hash!);
-        if (raw) {
-          const result: Record<string, unknown> = {
-            txHash: raw.txHash,
-            resultKind: raw.resultKind,
-            contractIds: raw.contractIds,
-            readout: raw.readout,
-          };
-          if (analysis) {
-            result.analysis = {
-              summary: analysis.summary,
-              errorCategory: analysis.errorCategory,
-              likelyCause: analysis.likelyCause,
-              suggestedFix: analysis.suggestedFix,
-              detailedAnalysis: analysis.detailedAnalysis,
-              evidence: analysis.evidence,
-              relatedCodes: analysis.relatedCodes,
-              debugSteps: analysis.debugSteps,
-              confidence: analysis.confidence,
-            };
-          }
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify(result, null, 2),
-              },
-            ],
-          };
-        }
-
         return {
           content: [
             {
@@ -331,13 +248,26 @@ function createBaseServer(env: Env) {
     "Search the error knowledge base and return raw matching document chunks. Use diagnose_error for AI-powered answers instead.",
     {
       query: z.string().describe("Search query text"),
+      fingerprint: z.string().optional().describe("Filter to a specific fingerprint"),
+      contract_id: z.string().optional().describe("Filter to a primary contract"),
+      function_name: z.string().optional().describe("Filter to a function name"),
+      operation_type: z.string().optional().describe("Filter to a Soroban operation type"),
+      error_category: z.string().optional().describe("Filter to an error category"),
       max_results: z
         .number()
         .optional()
         .default(10)
         .describe("Max results (1-50)"),
     },
-    async ({ query, max_results }) => {
+    async ({
+      query,
+      fingerprint,
+      contract_id,
+      function_name,
+      operation_type,
+      error_category,
+      max_results,
+    }) => {
       try {
         const results = await (env.AI as any)
           .autorag(env.AI_SEARCH_INSTANCE)
@@ -345,6 +275,13 @@ function createBaseServer(env: Env) {
             query,
             max_num_results: Math.min(max_results ?? 10, 50),
             rewrite_query: true,
+            filters: buildAiSearchFilters({
+              fingerprint,
+              contractId: contract_id,
+              functionName: function_name,
+              operationType: operation_type,
+              errorCategory: error_category,
+            }),
           });
         return {
           content: [
@@ -354,6 +291,7 @@ function createBaseServer(env: Env) {
                 (results.data ?? []).map((d: any) => ({
                   filename: d.filename,
                   score: d.score,
+                  attributes: d.attributes ?? null,
                   text: d.content?.[0]?.text ?? "",
                 })),
                 null,
@@ -473,8 +411,8 @@ function createBaseServer(env: Env) {
       prefix: z
         .string()
         .optional()
-        .default("errors/")
-        .describe("File prefix ('errors/', 'examples/', or legacy 'raw/')"),
+        .default("search-docs/")
+        .describe("File prefix ('search-docs/', 'errors/', 'examples/', or 'tx-index/')"),
       limit: z
         .number()
         .optional()
@@ -484,7 +422,7 @@ function createBaseServer(env: Env) {
     async ({ prefix, limit }) => {
       try {
         const listed = await env.ERRORS_BUCKET.list({
-          prefix: prefix ?? "errors/",
+          prefix: prefix ?? "search-docs/",
           limit: Math.min(limit ?? 100, 1000),
         });
         return {
@@ -523,19 +461,5 @@ function createBaseServer(env: Env) {
 }
 
 export async function createMcpFetchHandler(env: Env) {
-  // McpServer is stateful per-connection, so create fresh per request
-  const baseServer = createBaseServer(env);
-
-  const executor = new DynamicWorkerExecutor({
-    loader: env.LOADER,
-    globalOutbound: null, // fully network-isolated sandbox
-    timeout: 30000,
-  });
-
-  const server = await codeMcpServer({
-    server: baseServer,
-    executor,
-  });
-
-  return createMcpHandler(server);
+  return createMcpHandler(createBaseServer(env));
 }

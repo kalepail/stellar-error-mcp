@@ -355,6 +355,16 @@ export function buildDecodedTransactionContext(
     processingOperations: operationContexts,
     ledgerChanges: buildLedgerChanges(operationContexts),
     touchedContractIds: [...touchedContractIds],
+  };
+}
+
+export function attachDeepDecodedViews(
+  decoded: DecodedTransactionContext,
+  envelope: unknown,
+  processing: unknown,
+): DecodedTransactionContext {
+  return {
+    ...decoded,
     decodedEnvelope: deepDecodeXdr(envelope, 4),
     decodedProcessing: deepDecodeXdr(processing, 4),
   };
