@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 
-const SEARCH_DOCS_INCLUDE_PATTERN = "/search-docs/**";
+const SEARCH_DOCS_INCLUDE_PATTERN = "search-docs/**";
 const AI_SEARCH_CUSTOM_METADATA = [
   { field_name: "fingerprint", data_type: "text" },
   { field_name: "error_category", data_type: "text" },

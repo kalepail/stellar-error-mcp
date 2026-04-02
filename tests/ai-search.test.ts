@@ -85,7 +85,7 @@ describe("ai search helpers", () => {
   });
 
   it("exports the expected v1 search config constants", () => {
-    expect(SEARCH_DOCS_INCLUDE_PATTERN).toBe("/search-docs/**");
+    expect(SEARCH_DOCS_INCLUDE_PATTERN).toBe("search-docs/**");
     expect(AI_SEARCH_CUSTOM_METADATA).toEqual([
       { field_name: "fingerprint", data_type: "text" },
       { field_name: "error_category", data_type: "text" },

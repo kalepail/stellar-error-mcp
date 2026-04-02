@@ -2,7 +2,7 @@ import type { ErrorEntry } from "./types.js";
 
 export const SEARCH_DOCS_PREFIX = "search-docs/";
 export const SEARCH_DOCS_FOLDER = "search-docs/";
-export const SEARCH_DOCS_INCLUDE_PATTERN = "/search-docs/**";
+export const SEARCH_DOCS_INCLUDE_PATTERN = "search-docs/**";
 
 export const AI_SEARCH_CUSTOM_METADATA = [
   { field_name: "fingerprint", data_type: "text" },
