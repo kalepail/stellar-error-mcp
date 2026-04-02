@@ -90,6 +90,10 @@ npm run deploy
 
 **`decode_xdr`** — Decode arbitrary base64 XDR blobs into rich JSON with automatic type guessing.
 
+**`search_errors`** — Return raw matching AI Search chunks without synthesized analysis.
+
+**`list_errors`** — List stored error/example objects in R2.
+
 ## Project structure
 
 ```

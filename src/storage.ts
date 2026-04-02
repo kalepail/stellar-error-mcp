@@ -6,11 +6,11 @@ import type {
   ExampleTransactionRecord,
   FailedTransaction,
 } from "./types.js";
-import { buildErrorDescription } from "./fingerprint.js";
 
 const CURSOR_KEY = "last_processed_ledger";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
+const MAX_TX_HASHES_PER_ENTRY = 50;
 
 // --- Error Entry (fingerprint-based, deduplicated) ---
 
@@ -45,10 +45,8 @@ export async function storeErrorEntry(
 
 /**
  * Increment the occurrence count on an existing error entry.
- * Appends the tx hash and updates lastSeen.
+ * Deduplicates and keeps a sliding window of the most recent tx hashes.
  */
-const MAX_TX_HASHES = 100;
-
 export async function bumpErrorEntry(
   env: Env,
   entry: ErrorEntry,
@@ -57,7 +55,7 @@ export async function bumpErrorEntry(
 ): Promise<void> {
   entry.seenCount += 1;
   entry.txHashes = [...entry.txHashes.filter((h) => h !== txHash), txHash]
-    .slice(-MAX_TX_HASHES);
+    .slice(-MAX_TX_HASHES_PER_ENTRY);
   entry.lastSeen = ledgerCloseTime;
   await storeErrorEntry(env, entry);
 }
