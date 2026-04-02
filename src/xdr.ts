@@ -62,7 +62,8 @@ export function guessXdrType(xdrBase64: string): string[] {
 
 /**
  * Decode a base64-encoded XDR blob to rich SEP-51 JSON.
- * If type is known, pass it directly. Otherwise, uses guess() to find the type.
+ * If type is known, pass it directly. Otherwise, uses guess() to find the type
+ * and iterates through candidates in preferred order.
  * Returns the parsed JSON object, or null if decoding fails.
  */
 export function decodeXdr(
@@ -77,7 +78,7 @@ export function decodeXdr(
       return parseDecodedJson(jsonStr);
     }
 
-    // Auto-guess the type and try each in preference order
+    // Auto-guess the type
     const types = guess(normalized);
     if (types.length === 0) return null;
 
@@ -98,6 +99,7 @@ export function decodeXdr(
 
 /**
  * Decode a base64 XDR blob and return both the type and decoded JSON.
+ * Iterates through candidate types in preferred order.
  */
 export function decodeXdrWithType(
   xdrBase64: string,

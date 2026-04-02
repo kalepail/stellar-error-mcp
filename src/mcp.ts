@@ -12,6 +12,8 @@ import {
 } from "./storage.js";
 import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
 
+const FIND_TX_HASH_CONCURRENCY = 10;
+
 async function findErrorEntryByTxHash(
   env: Env,
   txHash: string,
@@ -25,18 +27,30 @@ async function findErrorEntryByTxHash(
       cursor,
     });
 
-    for (const obj of listed.objects) {
-      const data = await env.ERRORS_BUCKET.get(obj.key);
-      if (!data) continue;
-      const entry = await data.json();
-      if (
-        entry &&
-        typeof entry === "object" &&
-        Array.isArray((entry as { txHashes?: unknown[] }).txHashes) &&
-        (entry as { txHashes: unknown[] }).txHashes.includes(txHash)
-      ) {
-        return entry;
-      }
+    // Process in batches with concurrency cap
+    for (let i = 0; i < listed.objects.length; i += FIND_TX_HASH_CONCURRENCY) {
+      const batch = listed.objects.slice(i, i + FIND_TX_HASH_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (obj) => {
+          const data = await env.ERRORS_BUCKET.get(obj.key);
+          if (!data) return null;
+          try {
+            const entry = await data.json() as any;
+            if (
+              entry &&
+              Array.isArray(entry.txHashes) &&
+              entry.txHashes.includes(txHash)
+            ) {
+              return entry;
+            }
+          } catch {
+            // skip malformed entries
+          }
+          return null;
+        }),
+      );
+      const found = results.find((r) => r !== null);
+      if (found) return found;
     }
 
     cursor = listed.truncated ? listed.cursor : undefined;
@@ -191,18 +205,18 @@ function createBaseServer(env: Env) {
           };
         }
 
-        // Search by tx_hash across paginated error entries
-        const entry = await findErrorEntryByTxHash(env, tx_hash!);
-        if (entry) {
-          const entryObj = entry as { fingerprint?: string };
-          const example = entryObj.fingerprint
-            ? await getExampleTransaction(env, entryObj.fingerprint)
-            : null;
+        // Search by tx_hash across paginated error entries (batched reads)
+        const foundEntry = await findErrorEntryByTxHash(env, tx_hash!);
+        if (foundEntry) {
+          const example = await getExampleTransaction(
+            env,
+            foundEntry.fingerprint,
+          );
           return {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify({ entry, example }, null, 2),
+                text: JSON.stringify({ entry: foundEntry, example }, null, 2),
               },
             ],
           };
@@ -415,29 +429,15 @@ function createBaseServer(env: Env) {
           };
         }
 
-        // Prefer common transaction types
-        const preferred = [
-          "TransactionEnvelope",
-          "TransactionResult",
-          "TransactionMeta",
-          "LedgerEntryData",
-          "SorobanTransactionData",
-          "LedgerKey",
-          "DiagnosticEvent",
-          "ScVal",
-        ];
-        const bestType =
-          preferred.find((t) => possibleTypes.includes(t)) ??
-          possibleTypes[0];
-
-        const decoded = decodeXdrWithType(xdr_base64, bestType);
+        // Let decodeXdrWithType iterate through types in preferred order
+        const decoded = decodeXdrWithType(xdr_base64);
         if (!decoded) {
           return {
             isError: true,
             content: [
               {
                 type: "text" as const,
-                text: `Failed to decode XDR as ${bestType}. Possible types: ${possibleTypes.join(", ")}.`,
+                text: `Failed to decode XDR. Possible types: ${possibleTypes.join(", ")}.`,
               },
             ],
           };

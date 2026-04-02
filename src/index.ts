@@ -51,8 +51,11 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 function getManagementTokenFromRequest(request: Request): string | null {
   const authorization = request.headers.get("authorization");
-  if (authorization?.startsWith("Bearer ")) {
-    return authorization.slice("Bearer ".length).trim();
+  if (authorization) {
+    const [scheme, ...rest] = authorization.split(/\s+/);
+    if (scheme && rest.length > 0 && scheme.toLowerCase() === "bearer") {
+      return rest.join(" ").trim();
+    }
   }
 
   const headerToken = request.headers.get(MANAGEMENT_TOKEN_HEADER)?.trim();
@@ -152,8 +155,11 @@ async function processNewLedgers(
     }
 
     // --- Layer 2: Vector similarity (semantic match) ---
+    const descriptionContracts = tx.primaryContractIds.length > 0
+      ? tx.primaryContractIds
+      : tx.contractIds;
     const description = buildErrorDescription(
-      tx.primaryContractIds,
+      descriptionContracts,
       functionName,
       errorSignatures,
       tx.resultKind,
@@ -177,8 +183,8 @@ async function processNewLedgers(
     }
 
     // --- Fetch contract specs for context ---
-    let contractContext: string | undefined;
     let contracts: Map<string, ContractMetadata> | undefined;
+    let contractContext: string | undefined;
     if (tx.contractIds.length > 0) {
       try {
         contracts = await fetchContractsForError(env, tx.contractIds);
@@ -195,7 +201,7 @@ async function processNewLedgers(
 
     const entry: ErrorEntry = {
       fingerprint,
-      contractIds: tx.primaryContractIds,
+      contractIds: tx.contractIds,
       functionName,
       errorSignatures,
       resultKind: tx.resultKind,
@@ -233,7 +239,7 @@ async function processNewLedgers(
       await indexErrorVector(env, fingerprint, description, {
         errorCategory: entry.errorCategory,
         functionName,
-        contractIds: tx.primaryContractIds.join(",").slice(0, 200),
+        contractIds: tx.contractIds.join(",").slice(0, 200),
         relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
       });
     } catch (error) {
