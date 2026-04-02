@@ -73,8 +73,8 @@ function buildUserPrompt(
       processing: tx.processingJson,
     },
     decoded: {
-      envelope: tx.decoded.decodedEnvelope,
-      processing: tx.decoded.decodedProcessing,
+      envelope: tx.decoded.decodedEnvelope ?? null,
+      processing: tx.decoded.decodedProcessing ?? null,
     },
     contracts: summarizeContracts(contracts),
   });
@@ -204,18 +204,25 @@ async function runAIWithRetry(
 
         if (!isRetryable || attempt === MAX_RETRIES) {
           if (model !== models[models.length - 1]) {
-            console.log(
-              `Model ${model} failed after ${attempt + 1} attempts, trying fallback...`,
-            );
+            console.warn(JSON.stringify({
+              level: "warn",
+              event: "analysis.model_fallback",
+              model,
+              attempts: attempt + 1,
+            }));
             break; // try next model
           }
           throw error;
         }
 
         const delay = RETRY_DELAYS[attempt] ?? 5000;
-        console.log(
-          `AI call attempt ${attempt + 1} failed (${model}), retrying in ${delay}ms...`,
-        );
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "analysis.retry",
+          model,
+          attempt: attempt + 1,
+          delayMs: delay,
+        }));
         await new Promise((r) => setTimeout(r, delay));
       }
     }
@@ -229,7 +236,7 @@ export async function analyzeFailedTransaction(
   tx: FailedTransaction,
   contracts?: Map<string, ContractMetadata>,
 ): Promise<AnalysisResult> {
-  const modelId = env.AI_MODEL;
+  const modelId = env.AI_ANALYSIS_MODEL;
 
   try {
     const messages = [
@@ -276,7 +283,12 @@ export async function analyzeFailedTransaction(
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`AI analysis failed for ${tx.txHash}: ${message}`);
+    console.error(JSON.stringify({
+      level: "error",
+      event: "analysis.failed",
+      txHash: tx.txHash,
+      error: message,
+    }));
 
     return {
       txHash: tx.txHash,

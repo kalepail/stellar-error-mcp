@@ -7,6 +7,7 @@ import { decode_stream } from "@stellar/stellar-xdr-json";
 import { parse, isSafeNumber } from "lossless-json";
 // @ts-ignore — Cloudflare Workers can import .wasm files directly
 import wasmModule from "@stellar/stellar-xdr-json/stellar_xdr_json_bg.wasm";
+import { normalizeXdrBase64 } from "./input.js";
 
 let initialized = false;
 const PREFERRED_XDR_TYPES = [
@@ -35,10 +36,6 @@ function parseDecodedJson(jsonString: string): unknown {
     // decoded transactions are persisted to R2 and returned through MCP.
     parseNumber: (value) => (isSafeNumber(value) ? Number(value) : value),
   });
-}
-
-function normalizeXdrBase64(xdrBase64: string): string {
-  return xdrBase64.trim();
 }
 
 function orderTypesByPreference(types: string[]): string[] {

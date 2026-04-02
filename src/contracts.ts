@@ -13,8 +13,15 @@ const { Spec } = contract;
 
 // --- R2 Cache ---
 
+const NEGATIVE_CACHE = Symbol("negative-contract-cache");
+const STALE_CACHE = Symbol("stale-contract-cache");
+type MemoryCacheValue =
+  | ContractMetadata
+  | typeof NEGATIVE_CACHE
+  | typeof STALE_CACHE;
+
 // In-memory cache for the current Worker invocation (avoids repeated R2 reads within a cycle)
-const memoryCache = new Map<string, ContractMetadata | null>();
+const memoryCache = new Map<string, MemoryCacheValue>();
 
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const CONTRACT_SECTION_TYPES = {
@@ -26,10 +33,20 @@ const CONTRACT_SECTION_TYPES = {
 export async function getCachedContract(
   env: Env,
   contractId: string,
-): Promise<ContractMetadata | null> {
+): Promise<
+  | { hit: true; value: ContractMetadata | null }
+  | { hit: false }
+> {
   // Tier 1: In-memory (free, same invocation)
   if (memoryCache.has(contractId)) {
-    return memoryCache.get(contractId)!;
+    const cached = memoryCache.get(contractId)!;
+    if (cached === NEGATIVE_CACHE) {
+      return { hit: true, value: null };
+    }
+    if (cached === STALE_CACHE) {
+      return { hit: false };
+    }
+    return { hit: true, value: cached };
   }
 
   // Tier 2: Cache API (free, same datacenter, persists across invocations)
@@ -43,7 +60,7 @@ export async function getCachedContract(
         const age = Date.now() - new Date(meta.fetchedAt).getTime();
         if (age <= CACHE_MAX_AGE_MS) {
           memoryCache.set(contractId, meta);
-          return meta;
+          return { hit: true, value: meta };
         }
       }
     }
@@ -54,8 +71,7 @@ export async function getCachedContract(
   // Tier 3: R2 (persistent, global)
   const obj = await env.ERRORS_BUCKET.get(`contracts/${contractId}.json`);
   if (!obj) {
-    memoryCache.set(contractId, null);
-    return null;
+    return { hit: false };
   }
 
   const meta: ContractMetadata = await obj.json();
@@ -64,9 +80,14 @@ export async function getCachedContract(
   if (meta.fetchedAt) {
     const age = Date.now() - new Date(meta.fetchedAt).getTime();
     if (age > CACHE_MAX_AGE_MS) {
-      console.log(`Contract ${contractId}: cache expired (${Math.floor(age / 86400000)}d old), refetching`);
-      memoryCache.set(contractId, null);
-      return null;
+      console.log(JSON.stringify({
+        level: "info",
+        event: "contracts.cache_expired",
+        contractId,
+        ageDays: Math.floor(age / 86400000),
+      }));
+      memoryCache.set(contractId, STALE_CACHE);
+      return { hit: false };
     }
   }
 
@@ -87,7 +108,7 @@ export async function getCachedContract(
     // Cache API may not be available
   }
 
-  return meta;
+  return { hit: true, value: meta };
 }
 
 async function cacheContract(env: Env, meta: ContractMetadata): Promise<void> {
@@ -165,7 +186,7 @@ export async function fetchContractMetadata(
   contractId: string,
 ): Promise<ContractMetadata | null> {
   const cached = await getCachedContract(env, contractId);
-  if (cached) return cached;
+  if (cached.hit) return cached.value;
 
   try {
     // Step 1: Fetch contract instance to get WASM hash
@@ -179,7 +200,12 @@ export async function fetchContractMetadata(
 
     const instanceEntries = await rpcGetLedgerEntries(env, [instanceKey]);
     if (instanceEntries.length === 0) {
-      console.log(`Contract ${contractId}: not found on-chain`);
+      console.log(JSON.stringify({
+        level: "info",
+        event: "contracts.not_found",
+        contractId,
+      }));
+      memoryCache.set(contractId, NEGATIVE_CACHE);
       return null;
     }
 
@@ -199,7 +225,12 @@ export async function fetchContractMetadata(
 
     const codeEntries = await rpcGetLedgerEntries(env, [codeKey]);
     if (codeEntries.length === 0) {
-      console.log(`Contract ${contractId}: WASM code not found`);
+      console.log(JSON.stringify({
+        level: "info",
+        event: "contracts.code_missing",
+        contractId,
+      }));
+      memoryCache.set(contractId, NEGATIVE_CACHE);
       return null;
     }
 
@@ -213,7 +244,12 @@ export async function fetchContractMetadata(
     const specSections = extractWasmCustomSections(wasmBytes, "contractspecv0");
     const specSection = specSections[0];
     if (!specSection) {
-      console.log(`Contract ${contractId}: no contractspecv0 section in WASM`);
+      console.log(JSON.stringify({
+        level: "info",
+        event: "contracts.spec_missing",
+        contractId,
+      }));
+      memoryCache.set(contractId, NEGATIVE_CACHE);
       return null;
     }
 
@@ -299,18 +335,32 @@ export async function fetchContractMetadata(
     await cacheContract(env, meta);
     memoryCache.set(contractId, meta);
 
-    console.log(
-      `Contract ${contractId}: ${functions.length} fns, ${errorEnums.flatMap((e) => e.cases).length} error codes, ${structs.length} structs`,
-    );
+    console.log(JSON.stringify({
+      level: "info",
+      event: "contracts.fetched",
+      contractId,
+      functionCount: functions.length,
+      errorCodeCount: errorEnums.flatMap((e) => e.cases).length,
+      structCount: structs.length,
+    }));
 
     return meta;
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    console.error(`Contract fetch failed for ${contractId}: ${msg}`);
+    console.error(JSON.stringify({
+      level: "error",
+      event: "contracts.fetch_failed",
+      contractId,
+      error: msg,
+    }));
     // Cache the failure too so we don't retry within the same cycle
-    memoryCache.set(contractId, null);
+    memoryCache.set(contractId, NEGATIVE_CACHE);
     return null;
   }
+}
+
+export function resetContractCacheForTests(): void {
+  memoryCache.clear();
 }
 
 /**

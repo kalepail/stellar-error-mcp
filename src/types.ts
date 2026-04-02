@@ -3,12 +3,12 @@ export interface Env {
   CURSOR_KV: KVNamespace;
   VECTORIZE: VectorizeIndex;
   AI: Ai;
-  LOADER: any; // WorkerLoader — Dynamic Workers binding
   MANAGEMENT_TOKEN?: string;
   STELLAR_ARCHIVE_RPC_TOKEN: string;
   STELLAR_ARCHIVE_RPC_ENDPOINT: string;
   AI_SEARCH_INSTANCE: string;
-  AI_MODEL: string;
+  AI_SEARCH_MODEL: string;
+  AI_ANALYSIS_MODEL: string;
 }
 
 export interface ErrorSignature {
@@ -69,8 +69,8 @@ export interface DecodedTransactionContext {
   processingOperations: TransactionOperationContext[];
   ledgerChanges: TransactionLedgerChange[];
   touchedContractIds: string[];
-  decodedEnvelope: unknown;
-  decodedProcessing: unknown;
+  decodedEnvelope?: unknown;
+  decodedProcessing?: unknown;
 }
 
 export interface ContractFunction {
@@ -172,7 +172,7 @@ export interface ErrorEntry {
   // Reference data
   exampleTxHash: string;
   exampleReadout: ErrorReadout;
-  // Contract context for AI Search indexing
+  // Optional contract context included in the searchable Markdown doc
   contractContext?: string;
 }
 

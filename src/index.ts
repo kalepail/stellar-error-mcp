@@ -5,6 +5,7 @@ import {
   getErrorEntry,
   storeErrorEntry,
   bumpErrorEntry,
+  storeTxHashPointer,
   storeExampleTransaction,
   findSimilarError,
   indexErrorVector,
@@ -20,6 +21,9 @@ import {
   fetchContractsForError,
   buildContractContext,
 } from "./contracts.js";
+import { SEARCH_DOCS_PREFIX } from "./ai-search.js";
+import { attachDeepDecodedViews } from "./transaction.js";
+import { parsePositiveInteger } from "./input.js";
 
 const MAX_LEDGERS_PER_CYCLE = 200;
 const COLD_START_LOOKBACK = 50;
@@ -29,6 +33,22 @@ interface ProcessOptions {
   maxLedgers?: number;
   startOverride?: number;
   maxFailed?: number;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function logInfo(event: string, fields: Record<string, unknown> = {}): void {
+  console.log(JSON.stringify({ level: "info", event, ...fields }));
+}
+
+function logWarn(event: string, fields: Record<string, unknown> = {}): void {
+  console.warn(JSON.stringify({ level: "warn", event, ...fields }));
+}
+
+function logError(event: string, fields: Record<string, unknown> = {}): void {
+  console.error(JSON.stringify({ level: "error", event, ...fields }));
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -96,14 +116,6 @@ function requireManagementAccess(
   return null;
 }
 
-function parsePositiveInteger(
-  rawValue: string | null,
-): number | null {
-  if (!rawValue) return null;
-  const value = Number.parseInt(rawValue, 10);
-  return Number.isFinite(value) && value > 0 ? value : null;
-}
-
 async function processNewLedgers(
   env: Env,
   opts: ProcessOptions = {},
@@ -114,14 +126,16 @@ async function processNewLedgers(
   if (startLedger === null) {
     const latest = await getLatestLedger(env);
     startLedger = latest - COLD_START_LOOKBACK;
-    console.log(
-      `Cold start: latest ledger ${latest}, starting from ${startLedger}`,
-    );
+    logInfo("scan.cold_start", { latestLedger: latest, startLedger });
   } else if (!opts.startOverride) {
     startLedger += 1;
   }
 
-  console.log(`Scanning from ledger ${startLedger} (max ${maxLedgers} ledgers)...`);
+  logInfo("scan.start", {
+    startLedger,
+    maxLedgers,
+    maxFailed: opts.maxFailed ?? null,
+  });
 
   const scanResult = await scanForFailedTransactions(
     env,
@@ -130,9 +144,11 @@ async function processNewLedgers(
     opts.maxFailed,
   );
 
-  console.log(
-    `Scanned ${scanResult.ledgersScanned} ledgers (${scanResult.pagesScanned} pages), found ${scanResult.transactions.length} failed Soroban txs`,
-  );
+  logInfo("scan.complete_fetch", {
+    ledgersScanned: scanResult.ledgersScanned,
+    pagesScanned: scanResult.pagesScanned,
+    failedTransactions: scanResult.transactions.length,
+  });
 
   let newErrors = 0;
   let duplicates = 0;
@@ -148,9 +164,11 @@ async function processNewLedgers(
     if (existing) {
       await bumpErrorEntry(env, existing, tx.txHash, tx.ledgerCloseTime);
       duplicates++;
-      console.log(
-        `Duplicate #${existing.seenCount}: ${fingerprint.slice(0, 12)}... (${tx.txHash.slice(0, 12)}...)`,
-      );
+      logInfo("scan.duplicate", {
+        fingerprint,
+        txHash: tx.txHash,
+        seenCount: existing.seenCount + 1,
+      });
       continue;
     }
 
@@ -171,15 +189,14 @@ async function processNewLedgers(
       if (similar) {
         similarTo = similar.fingerprint;
         similarLinks++;
-        console.log(
-          `Semantically similar (${similar.score.toFixed(3)}): ${fingerprint.slice(0, 12)}... ≈ ${similar.fingerprint.slice(0, 12)}...`,
-        );
+        logInfo("scan.similar_match", {
+          fingerprint,
+          similarTo: similar.fingerprint,
+          score: Number(similar.score.toFixed(3)),
+        });
       }
     } catch (error) {
-      // Vectorize may not be available in local dev — proceed without it
-      console.log(
-        `Vector similarity check skipped: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      logWarn("scan.similarity_skipped", { error: formatError(error) });
     }
 
     // --- Fetch contract specs for context ---
@@ -190,22 +207,32 @@ async function processNewLedgers(
         contracts = await fetchContractsForError(env, tx.contractIds);
         contractContext = buildContractContext(contracts);
       } catch (error) {
-        console.log(
-          `Contract fetch skipped: ${error instanceof Error ? error.message : String(error)}`,
-        );
+        logWarn("scan.contract_fetch_skipped", {
+          txHash: tx.txHash,
+          error: formatError(error),
+        });
       }
     }
 
+    const enrichedTx = {
+      ...tx,
+      decoded: attachDeepDecodedViews(
+        tx.decoded,
+        tx.envelopeJson,
+        tx.processingJson,
+      ),
+    };
+
     // --- New error: analyze with AI (including contract specs) ---
-    const analysis = await analyzeFailedTransaction(env, tx, contracts);
+    const analysis = await analyzeFailedTransaction(env, enrichedTx, contracts);
 
     const entry: ErrorEntry = {
       fingerprint,
-      contractIds: tx.contractIds,
+      contractIds: enrichedTx.contractIds,
       functionName,
       errorSignatures,
-      resultKind: tx.resultKind,
-      sorobanOperationTypes: tx.sorobanOperationTypes,
+      resultKind: enrichedTx.resultKind,
+      sorobanOperationTypes: enrichedTx.sorobanOperationTypes,
       summary: analysis.summary,
       errorCategory: analysis.errorCategory,
       likelyCause: analysis.likelyCause,
@@ -217,19 +244,20 @@ async function processNewLedgers(
       confidence: analysis.confidence,
       modelId: analysis.modelId,
       seenCount: 1,
-      txHashes: [tx.txHash],
-      firstSeen: tx.ledgerCloseTime,
-      lastSeen: tx.ledgerCloseTime,
+      txHashes: [enrichedTx.txHash],
+      firstSeen: enrichedTx.ledgerCloseTime,
+      lastSeen: enrichedTx.ledgerCloseTime,
       similarTo,
-      exampleTxHash: tx.txHash,
-      exampleReadout: tx.readout,
+      exampleTxHash: enrichedTx.txHash,
+      exampleReadout: enrichedTx.readout,
       contractContext: contractContext ?? undefined,
     };
 
     await storeErrorEntry(env, entry);
+    await storeTxHashPointer(env, enrichedTx.txHash, fingerprint);
     await storeExampleTransaction(
       env,
-      tx,
+      enrichedTx,
       fingerprint,
       contracts ? [...contracts.values()] : [],
     );
@@ -239,26 +267,35 @@ async function processNewLedgers(
       await indexErrorVector(env, fingerprint, description, {
         errorCategory: entry.errorCategory,
         functionName,
-        contractIds: tx.contractIds.join(",").slice(0, 200),
+        contractIds: enrichedTx.contractIds.join(",").slice(0, 200),
         relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
       });
     } catch (error) {
-      console.log(
-        `Vector indexing skipped: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      logWarn("scan.vector_index_skipped", {
+        fingerprint,
+        error: formatError(error),
+      });
     }
 
     newErrors++;
-    console.log(
-      `New error ${fingerprint.slice(0, 12)}...: ${tx.resultKind} → ${entry.errorCategory} (${entry.confidence})${similarTo ? ` [similar to ${similarTo.slice(0, 12)}...]` : ""}`,
-    );
+    logInfo("scan.new_error", {
+      fingerprint,
+      txHash: tx.txHash,
+      resultKind: tx.resultKind,
+      errorCategory: entry.errorCategory,
+      confidence: entry.confidence,
+      similarTo: similarTo ?? null,
+    });
   }
 
   await setLastProcessedLedger(env, scanResult.lastLedgerProcessed);
 
-  console.log(
-    `Cycle complete: ${newErrors} new, ${duplicates} duplicates, ${similarLinks} similar links, cursor at ledger ${scanResult.lastLedgerProcessed}`,
-  );
+  logInfo("scan.cycle_complete", {
+    newErrors,
+    duplicates,
+    similarLinks,
+    lastLedgerProcessed: scanResult.lastLedgerProcessed,
+  });
 }
 
 export default {
@@ -285,8 +322,8 @@ export default {
         const lastLedger = await getLastProcessedLedger(env);
         return Response.json({ status: "ok", lastProcessedLedger: lastLedger });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error("Error while handling /trigger request:", error);
+        const message = formatError(error);
+        logError("http.trigger_failed", { error: message });
         return Response.json({ status: "error", message }, { status: 500 });
       }
     }
@@ -358,8 +395,7 @@ export default {
                   maxFailed: 100,
                 });
               } catch (error) {
-                const msg =
-                  error instanceof Error ? error.message : String(error);
+                const msg = formatError(error);
                 await write({ event: "chunk_error", cursor, error: msg });
               }
 
@@ -380,8 +416,7 @@ export default {
               lastLedger: await getLastProcessedLedger(env),
             });
           } catch (error) {
-            const msg =
-              error instanceof Error ? error.message : String(error);
+            const msg = formatError(error);
             await write({ event: "fatal", error: msg });
           } finally {
             await writer.close();
@@ -397,14 +432,6 @@ export default {
       });
     }
 
-    // Ingest stub for future manual ingest
-    if (url.pathname === "/ingest" && request.method === "POST") {
-      return Response.json(
-        { status: "not_implemented", message: "Manual ingest coming soon" },
-        { status: 501 },
-      );
-    }
-
     // Health check
     if (url.pathname === "/" || url.pathname === "/health") {
       const lastLedger = await getLastProcessedLedger(env);
@@ -412,9 +439,14 @@ export default {
         service: "stellar-error-mcp",
         status: "ok",
         lastProcessedLedger: lastLedger,
+        aiSearch: {
+          instance: env.AI_SEARCH_INSTANCE,
+          searchablePrefix: SEARCH_DOCS_PREFIX,
+        },
         endpoints: {
           mcp: "/mcp",
-          ingest: "/ingest (POST, coming soon)",
+          trigger: "/trigger",
+          batch: "/batch",
           health: "/health",
         },
       });
