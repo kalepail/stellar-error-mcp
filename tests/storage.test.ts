@@ -7,7 +7,7 @@ import {
   storeErrorEntry,
   storeTxHashPointer,
 } from "../src/storage.js";
-import { createTestEnv, MemoryKV, MemoryR2Bucket } from "./helpers.js";
+import { createTestEnv, MemoryR2Bucket } from "./helpers.js";
 
 const baseEntry = {
   fingerprint: "fp-1",
@@ -106,23 +106,31 @@ describe("storage", () => {
     expect(await searchDoc?.text()).toContain("Last seen: 2026-04-02T00:00:00.000Z");
   });
 
-  it("resolves tx hashes through KV pointer index, not R2", async () => {
+  it("writes tx hash pointers to the new R2 index and the legacy KV index", async () => {
     const bucket = new MemoryR2Bucket();
-    const kv = new MemoryKV();
-    const env = createTestEnv(bucket, kv);
+    const env = createTestEnv(bucket);
 
     await storeErrorEntry(env, baseEntry);
     expect(await findErrorEntryByTxHash(env, "tx-old")).toBeNull();
 
     await storeTxHashPointer(env, "tx-old", "fp-1");
-
-    // Verify pointer was written to KV, not R2
-    expect(kv.store.get("tx:tx-old")).toBe("fp-1");
-    expect(bucket.objects.has("tx-index/tx-old.json")).toBe(false);
+    await expect(env.CURSOR_KV.get("tx:tx-old")).resolves.toBe("fp-1");
 
     const found = await findErrorEntryByTxHash(env, "tx-old");
     expect(found?.fingerprint).toBe("fp-1");
     expect(bucket.listCalls).toHaveLength(0);
+  });
+
+  it("falls back to the legacy KV tx index and backfills the R2 pointer", async () => {
+    const bucket = new MemoryR2Bucket();
+    const env = createTestEnv(bucket);
+
+    await storeErrorEntry(env, baseEntry);
+    await env.CURSOR_KV.put("tx:tx-old", "fp-1");
+
+    const found = await findErrorEntryByTxHash(env, "tx-old");
+    expect(found?.fingerprint).toBe("fp-1");
+    expect(bucket.getJson("tx-index/tx-old.json")).toEqual({ fingerprint: "fp-1" });
   });
 
   it("rejects malformed current-shape entries instead of repairing them", () => {

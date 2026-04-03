@@ -5,7 +5,6 @@ import {
 } from "./transaction.js";
 import { normalizeXdrBase64 } from "./input.js";
 import type {
-  DirectErrorJob,
   DirectErrorSubmission,
   ErrorReadout,
   ErrorSignature,
@@ -23,6 +22,14 @@ function normalizeCode(value: string): string {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 96) || "unknown";
+}
+
+function pruneUndefined(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, inner]) => inner !== undefined),
+  );
 }
 
 function normalizeTimestamp(value: unknown, fallback: string): string {
@@ -173,15 +180,15 @@ function buildReadout(
 function buildProcessingJson(
   resultKind: string,
   diagnosticEvents: unknown[],
-  extra: Record<string, unknown>,
+  result: Record<string, unknown>,
+  transactionHash?: string,
 ): unknown {
   return {
     result: {
-      transaction_hash:
-        typeof extra.transaction_hash === "string" ? extra.transaction_hash : undefined,
+      transaction_hash: transactionHash,
       result: {
         [resultKind]: {
-          ...extra,
+          ...pruneUndefined(result),
         },
       },
     },
@@ -193,8 +200,21 @@ function buildProcessingJson(
         soroban_meta: null,
       },
     },
-    direct: extra,
   };
+}
+
+function buildSourcePayload(
+  submission: DirectErrorSubmission,
+  observedAt: string,
+): Record<string, unknown> | undefined {
+  if (!submission.sourceLabel && !submission.submittedAt) {
+    return undefined;
+  }
+
+  return pruneUndefined({
+    submittedAt: observedAt,
+    sourceLabel: submission.sourceLabel,
+  });
 }
 
 export function parseDirectErrorSubmission(
@@ -207,23 +227,9 @@ export function parseDirectErrorSubmission(
   const kind = raw.kind;
   const transactionXdr = typeof raw.transactionXdr === "string"
     ? raw.transactionXdr
-    : typeof raw.transaction_xdr === "string"
-    ? raw.transaction_xdr
-    : typeof raw.envelopeXdr === "string"
-    ? raw.envelopeXdr
-    : typeof raw.envelope_xdr === "string"
-    ? raw.envelope_xdr
     : null;
   const response = isRecord(raw.response)
     ? raw.response
-    : isRecord(raw.sendTransactionResponse)
-    ? raw.sendTransactionResponse
-    : isRecord(raw.send_transaction_response)
-    ? raw.send_transaction_response
-    : isRecord(raw.simulateTransactionResponse)
-    ? raw.simulateTransactionResponse
-    : isRecord(raw.simulate_transaction_response)
-    ? raw.simulate_transaction_response
     : null;
 
   if (kind !== "rpc_send" && kind !== "rpc_simulate") {
@@ -242,13 +248,9 @@ export function parseDirectErrorSubmission(
     response,
     submittedAt: typeof raw.submittedAt === "string"
       ? raw.submittedAt
-      : typeof raw.submitted_at === "string"
-      ? raw.submitted_at
       : undefined,
     sourceLabel: typeof raw.sourceLabel === "string"
       ? raw.sourceLabel
-      : typeof raw.source_label === "string"
-      ? raw.source_label
       : undefined,
   };
 }
@@ -287,12 +289,23 @@ export async function buildFailedTransactionFromDirectError(
     const processingJson = buildProcessingJson(
       resultKind ?? "rpc_send_error",
       diagnosticEvents,
-      {
-        ...submission.response,
+      pruneUndefined({
+        status:
+          typeof submission.response.status === "string"
+            ? submission.response.status
+            : undefined,
+        latestLedger:
+          typeof submission.response.latestLedger === "number"
+            ? submission.response.latestLedger
+            : undefined,
+        latestLedgerCloseTime:
+          typeof submission.response.latestLedgerCloseTime === "number"
+            ? submission.response.latestLedgerCloseTime
+            : undefined,
         errorResult: resultJson,
-        transaction_hash: hash,
         sourceLabel: submission.sourceLabel,
-      },
+      }),
+      hash,
     );
     const decoded = buildDecodedTransactionContext(envelopeJson, processingJson);
     if (decoded.errorSignatures.length === 0) {
@@ -352,11 +365,7 @@ export async function buildFailedTransactionFromDirectError(
         submission.response,
         hash,
       ),
-      sourcePayload: {
-        submittedAt: observedAt,
-        sourceLabel: submission.sourceLabel,
-        response: submission.response,
-      },
+      sourcePayload: buildSourcePayload(submission, observedAt),
     };
   }
 
@@ -368,7 +377,15 @@ export async function buildFailedTransactionFromDirectError(
   const diagnosticEvents = parseDiagnosticEvents(submission.response.events);
   const resultKind = `simulate:${normalizeCode(submission.response.error)}`;
   const processingJson = buildProcessingJson(resultKind, diagnosticEvents, {
-    ...submission.response,
+    error: submission.response.error,
+    latestLedger:
+      typeof submission.response.latestLedger === "number"
+        ? submission.response.latestLedger
+        : undefined,
+    latestLedgerCloseTime:
+      typeof submission.response.latestLedgerCloseTime === "number"
+        ? submission.response.latestLedgerCloseTime
+        : undefined,
     sourceLabel: submission.sourceLabel,
   });
   const decoded = buildDecodedTransactionContext(envelopeJson, processingJson);
@@ -429,27 +446,6 @@ export async function buildFailedTransactionFromDirectError(
       submission.response,
       sourceReference,
     ),
-    sourcePayload: {
-      submittedAt: observedAt,
-      sourceLabel: submission.sourceLabel,
-      response: submission.response,
-    },
-  };
-}
-
-export function buildQueuedDirectErrorJob(
-  jobId: string,
-  submission: DirectErrorSubmission,
-  sourceReference?: string,
-): DirectErrorJob {
-  const now = new Date().toISOString();
-  return {
-    jobId,
-    status: "queued",
-    createdAt: now,
-    updatedAt: now,
-    kind: submission.kind,
-    submission,
-    sourceReference,
+    sourcePayload: buildSourcePayload(submission, observedAt),
   };
 }

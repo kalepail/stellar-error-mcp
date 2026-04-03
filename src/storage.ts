@@ -1,6 +1,8 @@
 import type {
+  ActiveRecurringScanRecord,
+  AsyncJob,
+  AsyncJobInput,
   ContractMetadata,
-  DirectErrorJob,
   Env,
   ErrorEntry,
   ErrorReadout,
@@ -11,10 +13,20 @@ import type {
 import { buildSearchDocument } from "./ai-search.js";
 
 const CURSOR_KEY = "last_processed_ledger";
+const ACTIVE_RECURRING_SCAN_KEY = "active_recurring_scan_job";
+const ACTIVE_DIRECT_JOB_PREFIX = "active_direct_job:";
+const LEGACY_TX_INDEX_PREFIX = "tx:";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
 const MAX_TX_HASHES_PER_ENTRY = 50;
 const JOBS_PREFIX = "jobs/";
+const JOB_INPUTS_PREFIX = "job-inputs/";
+const JOB_RESULTS_PREFIX = "job-results/";
+const JOB_STAGING_PREFIX = "job-staging/";
+
+function txIndexObjectKey(txHash: string): string {
+  return `tx-index/${txHash}.json`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -308,32 +320,47 @@ export async function bumpErrorEntry(
   await storeTxHashPointer(env, txHash, normalized.fingerprint);
 }
 
-const TX_INDEX_PREFIX = "tx:";
-
 export async function storeTxHashPointer(
   env: Env,
   txHash: string,
   fingerprint: string,
 ): Promise<void> {
-  await env.CURSOR_KV.put(`${TX_INDEX_PREFIX}${txHash}`, fingerprint);
+  await env.ERRORS_BUCKET.put(
+    txIndexObjectKey(txHash),
+    JSON.stringify({ fingerprint }, null, 2),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { txHash, fingerprint },
+    },
+  );
+  await env.CURSOR_KV.put(`${LEGACY_TX_INDEX_PREFIX}${txHash}`, fingerprint);
 }
 
 export async function getFingerprintByTxHash(
   env: Env,
   txHash: string,
 ): Promise<string | null> {
-  const value = await env.CURSOR_KV.get(`${TX_INDEX_PREFIX}${txHash}`);
-  return value && value.length > 0 ? value : null;
-}
+  const object = await env.ERRORS_BUCKET.get(txIndexObjectKey(txHash));
+  if (object) {
+    const raw = await object.json();
+    if (isRecord(raw) && typeof raw.fingerprint === "string" && raw.fingerprint.length > 0) {
+      return raw.fingerprint;
+    }
+  }
 
-export async function listTxIndexKeys(
-  env: Env,
-  limit: number,
-): Promise<{ keys: { name: string }[] }> {
-  return env.CURSOR_KV.list({
-    prefix: TX_INDEX_PREFIX,
-    limit: Math.min(limit, 1000),
-  });
+  const legacy = await env.CURSOR_KV.get(`${LEGACY_TX_INDEX_PREFIX}${txHash}`);
+  if (!legacy) return null;
+
+  // Backfill the new R2 index lazily so older deployments keep exact-dedupe behavior.
+  await env.ERRORS_BUCKET.put(
+    txIndexObjectKey(txHash),
+    JSON.stringify({ fingerprint: legacy }, null, 2),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { txHash, fingerprint: legacy },
+    },
+  );
+  return legacy;
 }
 
 export async function findErrorEntryByTxHash(
@@ -464,9 +491,9 @@ export function resetStorageStateForTests(): void {
   // No-op placeholder for test parity.
 }
 
-export async function storeDirectErrorJob(
+export async function storeAsyncJob(
   env: Env,
-  job: DirectErrorJob,
+  job: AsyncJob,
 ): Promise<void> {
   await env.ERRORS_BUCKET.put(
     `${JOBS_PREFIX}${job.jobId}.json`,
@@ -477,18 +504,145 @@ export async function storeDirectErrorJob(
         jobId: job.jobId,
         status: job.status,
         kind: job.kind,
-        fingerprint: job.result?.fingerprint ?? "",
+        fingerprint:
+          job.result && "fingerprint" in job.result
+            ? job.result.fingerprint
+            : "",
         sourceReference: job.sourceReference ?? "",
       },
     },
   );
 }
 
-export async function getDirectErrorJob(
+export async function getAsyncJob(
   env: Env,
   jobId: string,
-): Promise<DirectErrorJob | null> {
+): Promise<AsyncJob | null> {
   const object = await env.ERRORS_BUCKET.get(`${JOBS_PREFIX}${jobId}.json`);
   if (!object) return null;
-  return await object.json() as DirectErrorJob;
+  return await object.json() as AsyncJob;
+}
+
+export async function storeJobInput(
+  env: Env,
+  jobId: string,
+  input: AsyncJobInput,
+): Promise<void> {
+  await env.ERRORS_BUCKET.put(
+    `${JOB_INPUTS_PREFIX}${jobId}.json`,
+    JSON.stringify(input, null, 2),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
+export async function getJobInput(
+  env: Env,
+  jobId: string,
+): Promise<AsyncJobInput | null> {
+  const object = await env.ERRORS_BUCKET.get(`${JOB_INPUTS_PREFIX}${jobId}.json`);
+  if (!object) return null;
+  return await object.json() as AsyncJobInput;
+}
+
+export async function storeJobResultArtifact(
+  env: Env,
+  jobId: string,
+  payload: unknown,
+): Promise<string> {
+  const key = `${JOB_RESULTS_PREFIX}${jobId}.json`;
+  await env.ERRORS_BUCKET.put(key, JSON.stringify(payload, null, 2), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return key;
+}
+
+export async function storeStagedFailedTransaction(
+  env: Env,
+  jobId: string,
+  txHash: string,
+  transaction: FailedTransaction,
+): Promise<string> {
+  const safeHash = txHash.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const key = `${JOB_STAGING_PREFIX}${jobId}/transactions/${safeHash}.json`;
+  await env.ERRORS_BUCKET.put(key, JSON.stringify(transaction, null, 2), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return key;
+}
+
+export async function getStagedFailedTransaction(
+  env: Env,
+  key: string,
+): Promise<FailedTransaction | null> {
+  const object = await env.ERRORS_BUCKET.get(key);
+  if (!object) return null;
+  return await object.json() as FailedTransaction;
+}
+
+export async function storeJobStepResult(
+  env: Env,
+  jobId: string,
+  stepName: string,
+  result: unknown,
+): Promise<void> {
+  await env.ERRORS_BUCKET.put(
+    `${JOB_STAGING_PREFIX}${jobId}/step-results/${stepName}.json`,
+    JSON.stringify(result, null, 2),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
+export async function getJobStepResult<T>(
+  env: Env,
+  jobId: string,
+  stepName: string,
+): Promise<T | null> {
+  const object = await env.ERRORS_BUCKET.get(
+    `${JOB_STAGING_PREFIX}${jobId}/step-results/${stepName}.json`,
+  );
+  if (!object) return null;
+  return await object.json() as T;
+}
+
+export async function setActiveRecurringScanRecord(
+  env: Env,
+  record: ActiveRecurringScanRecord | null,
+): Promise<void> {
+  if (!record) {
+    await env.CURSOR_KV.delete(ACTIVE_RECURRING_SCAN_KEY);
+    return;
+  }
+  await env.CURSOR_KV.put(ACTIVE_RECURRING_SCAN_KEY, JSON.stringify(record));
+}
+
+export async function getActiveRecurringScanRecord(
+  env: Env,
+): Promise<ActiveRecurringScanRecord | null> {
+  const value = await env.CURSOR_KV.get(ACTIVE_RECURRING_SCAN_KEY);
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as ActiveRecurringScanRecord;
+  } catch {
+    return null;
+  }
+}
+
+export async function setActiveDirectJob(
+  env: Env,
+  txHash: string,
+  jobId: string | null,
+): Promise<void> {
+  const key = `${ACTIVE_DIRECT_JOB_PREFIX}${txHash}`;
+  if (!jobId) {
+    await env.CURSOR_KV.delete(key);
+    return;
+  }
+  await env.CURSOR_KV.put(key, jobId);
+}
+
+export async function getActiveDirectJob(
+  env: Env,
+  txHash: string,
+): Promise<string | null> {
+  return env.CURSOR_KV.get(`${ACTIVE_DIRECT_JOB_PREFIX}${txHash}`);
 }

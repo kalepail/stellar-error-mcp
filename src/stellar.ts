@@ -1,6 +1,6 @@
 import type { Env, FailedTransaction, ErrorReadout, ScanResult } from "./types.js";
 import { buildDecodedTransactionContext } from "./transaction.js";
-import { getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
+import { buildRpcUrl, getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
 
 const SOROBAN_OPERATION_KEYS = new Set([
   "invoke_host_function",
@@ -46,15 +46,25 @@ async function fetchLedgerRange(
   limit: number,
   cursor?: string,
 ): Promise<any> {
+  const authMode = getRpcAuthMode(env);
   const payload = buildLedgersPayload(startLedger, limit, cursor);
-  const response = await fetch(env.STELLAR_ARCHIVE_RPC_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.STELLAR_ARCHIVE_RPC_TOKEN}`,
+  const response = await fetch(
+    buildRpcUrl(
+      env.STELLAR_ARCHIVE_RPC_ENDPOINT,
+      env.STELLAR_ARCHIVE_RPC_TOKEN,
+      authMode,
+    ),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(authMode === "path"
+          ? {}
+          : { Authorization: `Bearer ${env.STELLAR_ARCHIVE_RPC_TOKEN}` }),
+      },
+      body: payload,
     },
-    body: payload,
-  });
+  );
 
   if (!response.ok) {
     throw new Error(

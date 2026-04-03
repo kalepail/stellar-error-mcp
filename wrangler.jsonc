@@ -28,6 +28,24 @@
   "ai": {
     "binding": "AI"
   },
+  "workflows": [
+    {
+      "name": "stellar-error-direct",
+      "binding": "DIRECT_ERROR_WORKFLOW",
+      "class_name": "DirectErrorWorkflow",
+      "limits": {
+        "steps": 25000
+      }
+    },
+    {
+      "name": "stellar-error-ledger-range",
+      "binding": "LEDGER_RANGE_WORKFLOW",
+      "class_name": "LedgerRangeWorkflow",
+      "limits": {
+        "steps": 25000
+      }
+    }
+  ],
   "vars": {
     "STELLAR_ARCHIVE_RPC_ENDPOINT": "https://archive-rpc-pro.lightsail.network",
     "STELLAR_RPC_ENDPOINT": "https://rpc-pro.lightsail.network",

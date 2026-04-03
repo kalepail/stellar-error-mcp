@@ -1,22 +1,22 @@
 # stellar-error-mcp
 
-A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, accepts direct RPC error submissions for failed `sendTransaction` and `simulateTransaction` calls, deduplicates and analyzes them with AI, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
+A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, accepts direct RPC error submissions for failed `sendTransaction` and `simulateTransaction` calls, runs all long-lived work on Cloudflare Workflows, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
 
 ## How it works
 
 1. **Scan** — Every 5 minutes, fetches recent ledgers from the Stellar Archive RPC and extracts failed Soroban transactions (invoke, restore, extend operations).
-2. **Forward** — Internal callers can also submit raw RPC failures directly: pre-consensus `sendTransaction` rejections and failed `simulateTransaction` responses are normalized into the same ingestion pipeline asynchronously.
+2. **Forward** — Internal callers can submit raw RPC failures directly. Exact duplicates are detected inline; new errors are normalized once, staged in R2, and handed off to Workflow-backed async jobs.
 3. **Fingerprint** — Computes a SHA-256 fingerprint from contracts, function name, error signatures, and result kind. Duplicate errors increment a counter instead of being re-analyzed.
 4. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
 5. **Decode and enrich** — Each failed transaction is normalized into a first-class decoded artifact containing the raw envelope/processing JSON, recursively XDR-decoded views, invoke/auth/resource summaries, operation-level effects, ledger changes, and touched contract IDs.
 6. **Analyze** — Unique errors are sent to a Cloudflare AI model with the full enriched transaction plus contract specs and decoded WASM custom sections, encoded as TOON for high-fidelity LLM input. The model returns a structured analysis: summary, evidence-based classification, likely cause, suggested fix, related codes, debug steps, detailed analysis, and confidence level.
-7. **Store** — Canonical error entries, example transactions, tx-hash pointers, async direct-ingest job records, and contract metadata snapshots are persisted to R2. Each error also emits a curated Markdown document under `search-docs/` for AI Search indexing. Vectors are indexed in Vectorize for ingest-time semantic dedup.
+7. **Store** — Canonical error entries, example transactions, tx-hash pointers, public job snapshots, private Workflow inputs, staged Workflow artifacts, result artifacts, and contract metadata snapshots are persisted to R2. Each error also emits a curated Markdown document under `search-docs/` for AI Search indexing. Vectors are indexed in Vectorize for ingest-time semantic dedup.
 8. **Serve** — An MCP server exposes tools (`diagnose_error`, `get_error`, `get_error_example`, `decode_xdr`) so AI agents can query the knowledge base with natural language or raw XDR blobs.
 
 ## Prerequisites
 
 - Node.js
-- A Cloudflare account with access to Workers, R2, KV, Vectorize, AI, and AI Search
+- A Cloudflare account with access to Workers, Workflows, R2, KV, Vectorize, AI, and AI Search
 - A Stellar Archive RPC token
 
 ## Cloudflare resources
@@ -29,6 +29,7 @@ Create these before deploying:
 | KV Namespace | any — put the ID in `wrangler.jsonc` |
 | Vectorize Index | `stellar-error-fingerprints` (model: `@cf/baai/bge-base-en-v1.5`) |
 | AI Search | `stellar-errors` (R2-backed, scoped to `search-docs/**`) |
+| Workflows | `stellar-error-direct`, `stellar-error-ledger-range` |
 
 ## Setup
 
@@ -38,8 +39,8 @@ npm install
 
 Review `wrangler.jsonc` before deploying:
 
-- If you are deploying in a different Cloudflare account, replace `CURSOR_KV.id` with a KV namespace from that account.
-- `wrangler dev` uses local storage by default, so a `preview_id` is not required for normal local development.
+- If you are deploying in a different Cloudflare account, replace the bound resource IDs and names with resources from that account.
+- Keep local preview and production resources separate if you do not want preview traffic writing into the production data plane.
 
 Create a `.dev.vars` file with your RPC token:
 
@@ -81,7 +82,7 @@ npm run dev         # local dev server with cron test mode
 npm run types       # generate Cloudflare Worker types
 ```
 
-Trigger a scan manually:
+Start or reuse the recurring scan Workflow:
 
 ```bash
 curl -X POST http://localhost:8787/trigger
@@ -89,7 +90,7 @@ curl -X POST http://localhost:8787/trigger
 
 For deployed `/trigger` and `/batch` endpoints, send either `Authorization: Bearer <token>` or `x-management-token: <token>`.
 
-Forward a direct RPC error asynchronously:
+Forward a direct RPC error:
 
 ```bash
 curl -X POST http://localhost:8787/forward-error \
@@ -107,11 +108,15 @@ curl -X POST http://localhost:8787/forward-error \
   }'
 ```
 
-Poll the returned job later:
+If the submission is an exact duplicate, the endpoint returns `200 { status: "duplicate", ... }` immediately.
+
+If the submission is new, poll the returned job later:
 
 ```bash
-curl http://localhost:8787/jobs/job_<id>
+curl http://localhost:8787/jobs/de_<id>
 ```
+
+The public job response is the only polling surface. There is no `/jobs/:jobId/process` endpoint.
 
 Run the live RPC shape-capture suite:
 
@@ -141,11 +146,11 @@ npm run deploy
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Service status and last processed ledger |
-| `POST` | `/trigger` | Run one scan cycle |
-| `POST` | `/batch?hours=24` | Backfill a time range (streams NDJSON progress) |
+| `POST` | `/trigger` | Start or reuse the recurring scan Workflow |
+| `POST` | `/batch?hours=24` | Create an async backfill job for a time range |
 | `POST` | `/batch?start=N&end=M` | Backfill a specific ledger range |
-| `POST` | `/forward-error` | Queue a direct `rpc_send` or `rpc_simulate` error for async dedupe + analysis |
-| `GET` | `/jobs/:jobId` | Poll a queued direct-ingest job until the error report is ready |
+| `POST` | `/forward-error` | Return an inline duplicate or create a Workflow-backed direct error job |
+| `GET` | `/jobs/:jobId` | Public polling endpoint for Workflow-backed jobs |
 | `POST` | `/mcp` | MCP protocol endpoint |
 
 ## MCP tools
@@ -167,6 +172,8 @@ npm run deploy
 ```
 src/
   index.ts          Entry point, HTTP routing, cron orchestration
+  workflows.ts      Workflow classes for direct errors and ledger ranges
+  jobs.ts           Job id generation, duplicate preflight, public sanitization
   stellar.ts        Ledger scanning, RPC client, transaction extraction
   transaction.ts    Shared transaction decoding and normalization helpers
   analysis.ts       AI analysis prompts and model calls
@@ -181,7 +188,7 @@ src/
 
 ## Configuration
 
-Key constants in `src/index.ts`:
+Key constants in `src/workflows.ts`:
 
 | Constant | Default | Description |
 |---|---|---|
@@ -190,17 +197,13 @@ Key constants in `src/index.ts`:
 
 AI Search and analysis models are configured separately in `wrangler.jsonc` under `vars`.
 
-## Storage layout
-
-### R2 (`stellar-errors`)
+## R2 layout
 
 - `errors/<fingerprint>.json`: canonical structured error records
 - `examples/<fingerprint>.json`: stored example transactions and contract snapshots
-- `jobs/<jobId>.json`: async direct-ingest job state and final report payload
+- `jobs/<jobId>.json`: public async job snapshots
+- `job-inputs/<jobId>.json`: private Workflow inputs and staged-artifact references
+- `job-results/<jobId>.json`: larger batch result artifacts
+- `job-staging/<jobId>/...`: staged Workflow transaction artifacts and step results
 - `tx-index/<txHash>.json`: direct tx-hash to fingerprint pointers
 - `search-docs/<fingerprint>.md`: the only documents intended for AI Search indexing
-
-### KV (`CURSOR_KV`)
-
-- `last_processed_ledger`: ledger cursor for the cron scanner
-- `tx:<txHash>`: transaction hash → fingerprint pointers (value is the fingerprint string)

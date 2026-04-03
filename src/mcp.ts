@@ -6,9 +6,9 @@ import {
   getErrorEntry,
   getExampleTransaction,
   findErrorEntryByTxHash,
-  listTxIndexKeys,
 } from "./storage.js";
 import { buildAiSearchFilters } from "./ai-search.js";
+import { sanitizeExampleTransaction } from "./jobs.js";
 import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
 
 function createBaseServer(env: Env) {
@@ -145,7 +145,9 @@ function createBaseServer(env: Env) {
               ],
             };
           }
-          const example = await getExampleTransaction(env, fingerprint);
+          const example = sanitizeExampleTransaction(
+            await getExampleTransaction(env, fingerprint),
+          );
           return {
             content: [
               {
@@ -159,9 +161,8 @@ function createBaseServer(env: Env) {
         // Search by tx_hash across paginated error entries (batched reads)
         const foundEntry = await findErrorEntryByTxHash(env, tx_hash!);
         if (foundEntry) {
-          const example = await getExampleTransaction(
-            env,
-            foundEntry.fingerprint,
+          const example = sanitizeExampleTransaction(
+            await getExampleTransaction(env, foundEntry.fingerprint),
           );
           return {
             content: [
@@ -206,7 +207,9 @@ function createBaseServer(env: Env) {
     },
     async ({ fingerprint }) => {
       try {
-        const example = await getExampleTransaction(env, fingerprint);
+        const example = sanitizeExampleTransaction(
+          await getExampleTransaction(env, fingerprint),
+        );
         if (!example) {
           return {
             content: [
@@ -407,7 +410,7 @@ function createBaseServer(env: Env) {
   // List stored error files — useful for Codemode
   server.tool(
     "list_errors",
-    "List deduplicated error entries stored in the R2 database. Returns filenames, sizes, and upload dates.",
+    "List deduplicated error entries stored in R2. Returns filenames, sizes, and upload dates.",
     {
       prefix: z
         .string()
@@ -424,25 +427,6 @@ function createBaseServer(env: Env) {
       try {
         const effectivePrefix = prefix ?? "search-docs/";
         const effectiveLimit = Math.min(limit ?? 100, 1000);
-
-        // tx-index lives in KV, not R2
-        if (effectivePrefix === "tx-index/") {
-          const result = await listTxIndexKeys(env, effectiveLimit);
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: JSON.stringify(
-                  result.keys.map((k) => ({
-                    key: `tx-index/${k.name.slice(3)}.json`,
-                  })),
-                  null,
-                  2,
-                ),
-              },
-            ],
-          };
-        }
 
         const listed = await env.ERRORS_BUCKET.list({
           prefix: effectivePrefix,

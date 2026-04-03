@@ -3,6 +3,8 @@ export interface Env {
   CURSOR_KV: KVNamespace;
   VECTORIZE: VectorizeIndex;
   AI: Ai;
+  DIRECT_ERROR_WORKFLOW: Workflow<DirectErrorWorkflowParams>;
+  LEDGER_RANGE_WORKFLOW: Workflow<LedgerRangeWorkflowParams>;
   MANAGEMENT_TOKEN?: string;
   MANAGEMENT_TOKEN_SECONDARY?: string;
   STELLAR_ARCHIVE_RPC_TOKEN: string;
@@ -230,27 +232,136 @@ export interface DirectErrorSubmission {
   sourceLabel?: string;
 }
 
-export type DirectErrorJobStatus =
+export type AsyncJobKind =
+  | "direct_error"
+  | "ledger_batch"
+  | "recurring_scan";
+
+export type AsyncJobStatus =
   | "queued"
-  | "processing"
+  | "running"
+  | "waiting"
   | "completed"
   | "failed";
+
+export type AsyncJobPhase =
+  | "accepted"
+  | "preflight"
+  | "scanning"
+  | "normalizing"
+  | "dedupe"
+  | "analyzing"
+  | "storing"
+  | "completed"
+  | "failed";
+
+export interface AsyncJobProgress {
+  completed: number;
+  total?: number;
+  unit: string;
+  message?: string;
+}
+
+export interface PublicFailedTransaction
+  extends Omit<FailedTransaction, "sourcePayload"> {
+  processingJson: unknown;
+}
+
+export interface PublicExampleTransactionRecord
+  extends Omit<ExampleTransactionRecord, "transaction"> {
+  transaction: PublicFailedTransaction;
+}
 
 export interface DirectErrorJobResult {
   duplicate: boolean;
   fingerprint: string;
   entry: ErrorEntry;
-  example: ExampleTransactionRecord | null;
+  example: PublicExampleTransactionRecord | null;
 }
 
-export interface DirectErrorJob {
+export interface LedgerRangeJobResult {
+  batchStart: number;
+  batchEnd: number;
+  ledgersScanned: number;
+  pagesScanned: number;
+  failedTransactions: number;
+  newErrors: number;
+  duplicates: number;
+  lastLedgerProcessed?: number;
+  artifactKey?: string;
+}
+
+export type AsyncJobResult =
+  | DirectErrorJobResult
+  | LedgerRangeJobResult;
+
+export interface AsyncJob {
   jobId: string;
-  status: DirectErrorJobStatus;
+  kind: AsyncJobKind;
+  status: AsyncJobStatus;
+  phase: AsyncJobPhase;
   createdAt: string;
   updatedAt: string;
-  kind: Exclude<ObservationKind, "ledger_scan">;
-  submission?: DirectErrorSubmission;
+  progress: AsyncJobProgress;
   sourceReference?: string;
+  workflowStatus?: string;
   error?: string;
-  result?: DirectErrorJobResult;
+  result?: AsyncJobResult;
+}
+
+export interface DirectErrorWorkflowInput {
+  jobId: string;
+  sourceReference: string;
+  stagedTransactionKey: string;
+  txHash: string;
+}
+
+export type LedgerRangeJobMode = "batch" | "recurring";
+
+export interface LedgerRangeWorkflowInput {
+  jobId: string;
+  kind: Extract<AsyncJobKind, "ledger_batch" | "recurring_scan">;
+  mode: LedgerRangeJobMode;
+  startLedger?: number;
+  endLedger?: number;
+  hours?: number;
+  updateCursor: boolean;
+  initiatedBy: string;
+}
+
+export type AsyncJobInput =
+  | DirectErrorWorkflowInput
+  | LedgerRangeWorkflowInput;
+
+export interface DirectErrorWorkflowParams {
+  jobId: string;
+}
+
+export interface LedgerRangeWorkflowParams {
+  jobId: string;
+}
+
+export interface StagedFailedTransactionRef {
+  key: string;
+  txHash: string;
+}
+
+export interface LedgerChunkSummary {
+  startLedger: number;
+  endLedger: number;
+  ledgersScanned: number;
+  pagesScanned: number;
+  failedTransactions: number;
+  refs: StagedFailedTransactionRef[];
+  lastLedgerProcessed: number;
+}
+
+export interface LedgerChunkIngestSummary {
+  newErrors: number;
+  duplicates: number;
+}
+
+export interface ActiveRecurringScanRecord {
+  jobId: string;
+  updatedAt: string;
 }

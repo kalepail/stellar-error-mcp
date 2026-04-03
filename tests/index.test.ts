@@ -1,173 +1,152 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestEnv } from "./helpers.js";
+import {
+  setActiveDirectJob,
+  setActiveRecurringScanRecord,
+  storeAsyncJob,
+} from "../src/storage.js";
+import type { AsyncJob } from "../src/types.js";
 
-let storedJob: Record<string, unknown> | null = null;
-
-const storeDirectErrorJob = vi.fn(async (_env: unknown, job: Record<string, unknown>) => {
-  storedJob = job;
-});
-const getDirectErrorJob = vi.fn(async (_env: unknown, jobId: string) => {
-  return storedJob?.jobId === jobId ? storedJob : null;
-});
+const { preflightDirectErrorSubmission } = vi.hoisted(() => ({
+  preflightDirectErrorSubmission: vi.fn(),
+}));
 
 vi.mock("../src/mcp.js", () => ({
   createMcpFetchHandler: async () => () => new Response("mock mcp"),
 }));
 
-vi.mock("../src/stellar.js", () => ({
-  getLatestLedger: async () => 123,
-  scanForFailedTransactions: async () => ({
-    transactions: [],
-    lastLedgerProcessed: 123,
-    pagesScanned: 0,
-    ledgersScanned: 0,
-  }),
-}));
-
-vi.mock("../src/storage.js", () => ({
-  getLastProcessedLedger: async () => null,
-  setLastProcessedLedger: async () => undefined,
-  storeDirectErrorJob,
-  getDirectErrorJob,
-}));
-
 vi.mock("../src/direct.js", () => ({
   parseDirectErrorSubmission: (value: unknown) => value,
-  buildQueuedDirectErrorJob: (jobId: string, submission: { kind: string }) => ({
-    jobId,
-    status: "queued",
-    createdAt: "2026-04-02T00:00:00.000Z",
-    updatedAt: "2026-04-02T00:00:00.000Z",
-    kind: submission.kind,
-    submission,
-  }),
-  buildFailedTransactionFromDirectError: async () => ({
-    observationKind: "rpc_send",
-    txHash: "tx-1",
-    ledgerSequence: 1,
-    ledgerCloseTime: "2026-04-02T00:00:00.000Z",
-    resultKind: "tx_bad_seq",
-    soroban: true,
-    primaryContractIds: [],
-    contractIds: [],
-    operationTypes: ["invoke_host_function"],
-    sorobanOperationTypes: ["invoke_host_function"],
-    diagnosticEvents: [],
-    envelopeJson: {},
-    processingJson: {},
-    decoded: {
-      topLevelFunction: "transfer",
-      errorSignatures: [],
-      invokeCalls: [],
-      authEntries: [],
-      resourceLimits: null,
-      transactionResult: null,
-      sorobanMeta: null,
-      contractEvents: [],
-      diagnosticEvents: [],
-      envelopeOperations: [],
-      processingOperations: [],
-      ledgerChanges: [],
-      touchedContractIds: [],
-    },
-    readout: {
-      observationKind: "rpc_send",
-      resultKind: "tx_bad_seq",
-      feeBump: false,
-      invokeCallCount: 0,
-      contractCount: 0,
-      hasSorobanMeta: false,
-      hasEvents: false,
-      hasDiagnosticEvents: false,
-    },
-  }),
 }));
 
-vi.mock("../src/ingest.js", () => ({
-  ingestFailedTransaction: async () => ({
-    status: "duplicate",
-    fingerprint: "fp-1",
-    entry: {
-      fingerprint: "fp-1",
-      observationKinds: ["rpc_send"],
-      contractIds: [],
-      functionName: "transfer",
-      errorSignatures: [],
-      resultKind: "tx_bad_seq",
-      sorobanOperationTypes: ["invoke_host_function"],
-      summary: "summary",
-      errorCategory: "category",
-      likelyCause: "cause",
-      suggestedFix: "fix",
-      detailedAnalysis: "details",
-      evidence: [],
-      relatedCodes: [],
-      debugSteps: [],
-      confidence: "low",
-      modelId: "model",
-      seenCount: 1,
-      txHashes: ["tx-1"],
-      firstSeen: "2026-04-02T00:00:00.000Z",
-      lastSeen: "2026-04-02T00:00:00.000Z",
-      exampleTxHash: "tx-1",
-      exampleReadout: {
-        observationKind: "rpc_send",
-        resultKind: "tx_bad_seq",
-        feeBump: false,
-        invokeCallCount: 0,
-        contractCount: 0,
-        hasSorobanMeta: false,
-        hasEvents: false,
-        hasDiagnosticEvents: false,
-      },
-    },
-    example: null,
-  }),
+vi.mock("../src/workflows.js", () => ({
+  DirectErrorWorkflow: class {},
+  LedgerRangeWorkflow: class {},
+  syncJobWithWorkflowStatus: async (_env: unknown, job: unknown) => job,
 }));
 
-describe("worker fetch smoke", () => {
+vi.mock("../src/jobs.js", async () => {
+  return {
+    createInitialJob: (
+      jobId: string,
+      kind: string,
+      phase: string,
+      progress: unknown,
+      sourceReference?: string,
+    ) => ({
+      jobId,
+      kind,
+      status: "queued",
+      phase,
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:00:00.000Z",
+      progress,
+      sourceReference,
+    }),
+    createJobId: (kind: string) =>
+      kind === "direct_error"
+        ? "de_generated"
+        : kind === "ledger_batch"
+        ? "lb_generated"
+        : "rs_generated",
+    isTerminalJobStatus: (status: string) =>
+      status === "completed" || status === "failed",
+    preflightDirectErrorSubmission,
+    updateJob: (job: Record<string, unknown>, patch: Record<string, unknown>) => ({
+      ...job,
+      ...patch,
+      updatedAt: "2026-04-02T00:01:00.000Z",
+    }),
+    workflowStatusToAsyncStatus: (status: string) =>
+      status === "complete"
+        ? "completed"
+        : status === "errored"
+        ? "failed"
+        : status === "running"
+        ? "running"
+        : "queued",
+    buildDirectWorkflowInput: (
+      jobId: string,
+      sourceReference: string,
+      stagedTransactionKey: string,
+      txHash: string,
+    ) => ({
+      jobId,
+      sourceReference,
+      stagedTransactionKey,
+      txHash,
+    }),
+  };
+});
+
+describe("worker fetch routes", () => {
   beforeEach(() => {
-    storedJob = null;
-    storeDirectErrorJob.mockClear();
-    getDirectErrorJob.mockReset();
-    getDirectErrorJob.mockImplementation(async (_env: unknown, jobId: string) => {
-      return storedJob?.jobId === jobId ? storedJob : null;
-    });
+    preflightDirectErrorSubmission.mockReset();
   });
 
-  it("serves a health document aligned with the v1 architecture", async () => {
+  it("serves a health document aligned with the workflow architecture", async () => {
     const { default: worker } = await import("../src/index.js");
     const response = await worker.fetch(
       new Request("https://example.com/health"),
       createTestEnv(),
-      {
-        waitUntil: () => undefined,
-      } as ExecutionContext,
+      { waitUntil: () => undefined } as ExecutionContext,
     );
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       service: "stellar-error-mcp",
-      status: "ok",
-      aiSearch: {
-        instance: "search",
-        searchablePrefix: "search-docs/",
-      },
       endpoints: {
-        mcp: "/mcp",
         trigger: "/trigger",
         batch: "/batch",
         forwardError: "/forward-error",
         jobStatus: "/jobs/:jobId",
-        health: "/health",
       },
     });
   });
 
-  it("accepts direct error submissions and returns a poll URL", async () => {
-    const waitUntil = vi.fn((promise: Promise<unknown>) => {
-      void promise.catch(() => undefined);
+  it("returns an inline duplicate response without creating a workflow", async () => {
+    preflightDirectErrorSubmission.mockResolvedValue({
+      duplicate: true,
+      sourceReference: "rpcsim-1",
+      fingerprint: "fp-1",
+      entry: { fingerprint: "fp-1", summary: "duplicate" },
+      example: null,
     });
+
+    const env = createTestEnv();
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/forward-error", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "rpc_simulate",
+          transactionXdr: "AAAA",
+          response: { error: "boom" },
+        }),
+      }),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "duplicate",
+      duplicate: true,
+      fingerprint: "fp-1",
+    });
+    expect(env.DIRECT_ERROR_WORKFLOW.created).toHaveLength(0);
+  });
+
+  it("creates a workflow-backed direct job and returns polling headers", async () => {
+    preflightDirectErrorSubmission.mockResolvedValue({
+      duplicate: false,
+      transaction: { txHash: "tx-1" },
+      fingerprint: "fp-new",
+      sourceReference: "rpcsend-1",
+    });
+
+    const env = createTestEnv();
     const { default: worker } = await import("../src/index.js");
     const response = await worker.fetch(
       new Request("http://localhost/forward-error", {
@@ -179,109 +158,165 @@ describe("worker fetch smoke", () => {
           response: { status: "ERROR" },
         }),
       }),
-      createTestEnv(),
-      {
-        waitUntil,
-      } as ExecutionContext,
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    expect(response.headers.get("Location")).toMatch(/^\/jobs\/de_/);
+    expect(response.headers.get("Retry-After")).toBe("5");
+    await expect(response.json()).resolves.toMatchObject({
+      status: "accepted",
+      duplicate: false,
+      sourceReference: "rpcsend-1",
+      jobId: expect.stringMatching(/^de_/),
+    });
+    expect(env.DIRECT_ERROR_WORKFLOW.created).toHaveLength(1);
+  });
+
+  it("reuses an active direct error job for the same tx hash", async () => {
+    preflightDirectErrorSubmission.mockResolvedValue({
+      duplicate: false,
+      transaction: { txHash: "tx-inflight" },
+      fingerprint: "fp-new",
+      sourceReference: "rpcsend-1",
+    });
+
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "de_inflight",
+      kind: "direct_error",
+      status: "running",
+      phase: "analyzing",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:01:00.000Z",
+      progress: { completed: 3, total: 4, unit: "steps" },
+      sourceReference: "rpcsend-1",
+      workflowStatus: "running",
+    };
+    await storeAsyncJob(env, job);
+    await setActiveDirectJob(env, "tx-inflight", job.jobId);
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/forward-error", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "rpc_send",
+          transactionXdr: "AAAA",
+          response: { status: "ERROR" },
+        }),
+      }),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
     );
 
     expect(response.status).toBe(202);
     await expect(response.json()).resolves.toMatchObject({
-      status: "accepted",
-      pollUrl: expect.stringMatching(/^\/jobs\/job_/),
-      processUrl: expect.stringMatching(/^\/jobs\/job_[a-f0-9]{16}\/process$/),
+      jobId: "de_inflight",
+      reused: true,
     });
-    expect(storeDirectErrorJob).toHaveBeenCalled();
-    expect(waitUntil).toHaveBeenCalledTimes(1);
+    expect(env.DIRECT_ERROR_WORKFLOW.created).toHaveLength(0);
   });
 
-  it("returns stored direct job state", async () => {
-    getDirectErrorJob.mockResolvedValue({
-      jobId: "job_1234567890abcdef",
+  it("serves public job status without exposing stored submission input", async () => {
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "de_publicjob",
+      kind: "direct_error",
       status: "completed",
+      phase: "completed",
       createdAt: "2026-04-02T00:00:00.000Z",
       updatedAt: "2026-04-02T00:01:00.000Z",
-      kind: "rpc_send",
+      progress: { completed: 4, total: 4, unit: "steps" },
+      sourceReference: "rpcsend-1",
+      workflowStatus: "complete",
       result: {
-        duplicate: true,
+        duplicate: false,
         fingerprint: "fp-1",
-        entry: { fingerprint: "fp-1" },
+        entry: { fingerprint: "fp-1", summary: "summary" } as never,
         example: null,
       },
-    });
+    };
+    await storeAsyncJob(env, job);
 
     const { default: worker } = await import("../src/index.js");
     const response = await worker.fetch(
-      new Request("http://localhost/jobs/job_1234567890abcdef"),
-      createTestEnv(),
-      {
-        waitUntil: () => undefined,
-      } as ExecutionContext,
+      new Request("https://example.com/jobs/de_publicjob"),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
-      jobId: "job_1234567890abcdef",
-      status: "completed",
-      result: {
-        duplicate: true,
-        fingerprint: "fp-1",
-      },
-    });
+    const json = await response.json() as Record<string, unknown>;
+    expect(json.jobId).toBe("de_publicjob");
+    expect(json.kind).toBe("direct_error");
+    expect(json).not.toHaveProperty("submission");
   });
 
-  it("does not process queued jobs inline during GET polling", async () => {
-    getDirectErrorJob.mockResolvedValue({
-      jobId: "job_1234567890abcdef",
-      status: "queued",
-      createdAt: "2026-04-02T00:00:00.000Z",
-      updatedAt: "2026-04-02T00:00:00.000Z",
-      kind: "rpc_send",
-    });
+  it("does not synthesize a public job when the snapshot is missing", async () => {
+    const env = createTestEnv();
+    env.DIRECT_ERROR_WORKFLOW.setStatus("de_orphaned", { status: "running" });
 
     const { default: worker } = await import("../src/index.js");
     const response = await worker.fetch(
-      new Request("http://localhost/jobs/job_1234567890abcdef"),
-      createTestEnv(),
-      {
-        waitUntil: () => undefined,
-      } as ExecutionContext,
-    );
-
-    expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({
-      jobId: "job_1234567890abcdef",
-      status: "queued",
-    });
-  });
-
-  it("rejects invalid direct job ids", async () => {
-    const { default: worker } = await import("../src/index.js");
-    const response = await worker.fetch(
-      new Request("http://localhost/jobs/not-a-real-job"),
-      createTestEnv(),
-      {
-        waitUntil: () => undefined,
-      } as ExecutionContext,
-    );
-
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({
-      status: "error",
-      message: "Invalid job id.",
-    });
-  });
-
-  it("does not expose the removed ingest endpoint", async () => {
-    const { default: worker } = await import("../src/index.js");
-    const response = await worker.fetch(
-      new Request("https://example.com/ingest", { method: "POST" }),
-      createTestEnv(),
-      {
-        waitUntil: () => undefined,
-      } as ExecutionContext,
+      new Request("https://example.com/jobs/de_orphaned"),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
     );
 
     expect(response.status).toBe(404);
+  });
+
+  it("reuses an active recurring scan job", async () => {
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "rs_activejob",
+      kind: "recurring_scan",
+      status: "running",
+      phase: "scanning",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:01:00.000Z",
+      progress: { completed: 5, total: 200, unit: "ledgers" },
+      workflowStatus: "running",
+    };
+    await storeAsyncJob(env, job);
+    await setActiveRecurringScanRecord(env, {
+      jobId: job.jobId,
+      updatedAt: job.updatedAt,
+    });
+    env.LEDGER_RANGE_WORKFLOW.setStatus(job.jobId, { status: "running" });
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/trigger", { method: "POST" }),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      jobId: "rs_activejob",
+      reused: true,
+    });
+    expect(env.LEDGER_RANGE_WORKFLOW.created).toHaveLength(0);
+  });
+
+  it("creates a batch workflow job", async () => {
+    const env = createTestEnv();
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/batch?start=10&end=20", { method: "POST" }),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      jobId: expect.stringMatching(/^lb_/),
+      status: "accepted",
+    });
+    expect(env.LEDGER_RANGE_WORKFLOW.created).toHaveLength(1);
   });
 });

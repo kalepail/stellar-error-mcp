@@ -67,37 +67,65 @@ export class MemoryR2Bucket {
   }
 }
 
-export class MemoryKV {
-  readonly store = new Map<string, string>();
-  readonly getCalls: string[] = [];
-  readonly putCalls: Array<{ key: string; value: string }> = [];
+export class MemoryWorkflowBinding<PARAMS = unknown> {
+  readonly created: WorkflowInstanceCreateOptions<PARAMS>[] = [];
+  readonly statuses = new Map<string, InstanceStatus>();
+
+  async create(
+    options: WorkflowInstanceCreateOptions<PARAMS> = {},
+  ): Promise<WorkflowInstance> {
+    const id = options.id ?? `wf_${this.created.length + 1}`;
+    this.created.push({ ...options, id });
+    if (!this.statuses.has(id)) {
+      this.statuses.set(id, { status: "queued" });
+    }
+    return this.get(id);
+  }
+
+  async get(id: string): Promise<WorkflowInstance> {
+    return {
+      id,
+      pause: async () => undefined,
+      resume: async () => undefined,
+      terminate: async () => undefined,
+      restart: async () => undefined,
+      status: async () => this.statuses.get(id) ?? { status: "unknown" },
+      sendEvent: async () => undefined,
+    } as WorkflowInstance;
+  }
+
+  setStatus(id: string, status: InstanceStatus): void {
+    this.statuses.set(id, status);
+  }
+}
+
+export class MemoryKVNamespace {
+  readonly values = new Map<string, string>();
 
   async get(key: string): Promise<string | null> {
-    this.getCalls.push(key);
-    return this.store.get(key) ?? null;
+    return this.values.get(key) ?? null;
   }
 
   async put(key: string, value: string): Promise<void> {
-    this.putCalls.push({ key, value });
-    this.store.set(key, value);
+    this.values.set(key, value);
   }
 
-  async list(options: { prefix?: string; limit?: number } = {}): Promise<{ keys: { name: string }[] }> {
-    const prefix = options.prefix ?? "";
-    const limit = options.limit ?? 1000;
-    const keys = [...this.store.keys()]
-      .filter((k) => k.startsWith(prefix))
-      .sort()
-      .slice(0, limit)
-      .map((name) => ({ name }));
-    return { keys };
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
   }
 }
 
 export function createTestEnv(
   bucket = new MemoryR2Bucket(),
-  kv = new MemoryKV(),
-): Env & { ERRORS_BUCKET: MemoryR2Bucket; CURSOR_KV: MemoryKV } {
+): Env & {
+  ERRORS_BUCKET: MemoryR2Bucket;
+  CURSOR_KV: MemoryKVNamespace;
+  DIRECT_ERROR_WORKFLOW: MemoryWorkflowBinding<{ jobId: string }>;
+  LEDGER_RANGE_WORKFLOW: MemoryWorkflowBinding<{ jobId: string }>;
+} {
+  const kv = new MemoryKVNamespace();
+  const directWorkflow = new MemoryWorkflowBinding<{ jobId: string }>();
+  const ledgerWorkflow = new MemoryWorkflowBinding<{ jobId: string }>();
   return {
     ERRORS_BUCKET: bucket,
     CURSOR_KV: kv as unknown as KVNamespace,
@@ -108,6 +136,12 @@ export function createTestEnv(
     AI: {
       run: async () => ({ data: [[0.1, 0.2, 0.3]] }),
     } as unknown as Ai,
+    DIRECT_ERROR_WORKFLOW: directWorkflow as unknown as Workflow<{
+      jobId: string;
+    }>,
+    LEDGER_RANGE_WORKFLOW: ledgerWorkflow as unknown as Workflow<{
+      jobId: string;
+    }>,
     STELLAR_ARCHIVE_RPC_TOKEN: "token",
     STELLAR_ARCHIVE_RPC_ENDPOINT: "https://archive-rpc.example.com",
     STELLAR_RPC_ENDPOINT: "https://rpc.example.com",

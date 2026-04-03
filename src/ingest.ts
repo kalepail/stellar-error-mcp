@@ -8,6 +8,7 @@ import type {
 import {
   bumpErrorEntry,
   findSimilarError,
+  findErrorEntryByTxHash,
   getErrorEntry,
   getExampleTransaction,
   indexErrorVector,
@@ -43,6 +44,21 @@ export async function ingestFailedTransaction(
   env: Env,
   tx: FailedTransaction,
 ): Promise<IngestFailedTransactionResult> {
+  const existingByTxHash = await findErrorEntryByTxHash(env, tx.txHash);
+  if (existingByTxHash) {
+    logInfo("ingest.txhash_reused", {
+      fingerprint: existingByTxHash.fingerprint,
+      txHash: tx.txHash,
+      observationKind: tx.observationKind,
+    });
+    return {
+      status: "duplicate",
+      fingerprint: existingByTxHash.fingerprint,
+      entry: existingByTxHash,
+      example: await getExampleTransaction(env, existingByTxHash.fingerprint),
+    };
+  }
+
   const { fingerprint, functionName, errorSignatures } =
     await buildFingerprint(tx);
 
