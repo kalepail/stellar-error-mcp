@@ -6,6 +6,7 @@ import {
   getErrorEntry,
   getExampleTransaction,
   findErrorEntryByTxHash,
+  listTxIndexKeys,
 } from "./storage.js";
 import { buildAiSearchFilters } from "./ai-search.js";
 import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
@@ -421,9 +422,31 @@ function createBaseServer(env: Env) {
     },
     async ({ prefix, limit }) => {
       try {
+        const effectivePrefix = prefix ?? "search-docs/";
+        const effectiveLimit = Math.min(limit ?? 100, 1000);
+
+        // tx-index lives in KV, not R2
+        if (effectivePrefix === "tx-index/") {
+          const result = await listTxIndexKeys(env, effectiveLimit);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  result.keys.map((k) => ({
+                    key: `tx-index/${k.name.slice(3)}.json`,
+                  })),
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
         const listed = await env.ERRORS_BUCKET.list({
-          prefix: prefix ?? "search-docs/",
-          limit: Math.min(limit ?? 100, 1000),
+          prefix: effectivePrefix,
+          limit: effectiveLimit,
         });
         return {
           content: [

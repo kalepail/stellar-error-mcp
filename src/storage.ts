@@ -260,34 +260,32 @@ export async function bumpErrorEntry(
   await storeTxHashPointer(env, txHash, normalized.fingerprint);
 }
 
+const TX_INDEX_PREFIX = "tx:";
+
 export async function storeTxHashPointer(
   env: Env,
   txHash: string,
   fingerprint: string,
 ): Promise<void> {
-  await env.ERRORS_BUCKET.put(
-    `tx-index/${txHash}.json`,
-    JSON.stringify({ fingerprint }, null, 2),
-    {
-      httpMetadata: { contentType: "application/json" },
-      customMetadata: { txHash, fingerprint },
-    },
-  );
+  await env.CURSOR_KV.put(`${TX_INDEX_PREFIX}${txHash}`, fingerprint);
 }
 
 export async function getFingerprintByTxHash(
   env: Env,
   txHash: string,
 ): Promise<string | null> {
-  const object = await env.ERRORS_BUCKET.get(`tx-index/${txHash}.json`);
-  if (!object) return null;
+  const value = await env.CURSOR_KV.get(`${TX_INDEX_PREFIX}${txHash}`);
+  return value && value.length > 0 ? value : null;
+}
 
-  const raw = await object.json();
-  if (!isRecord(raw) || typeof raw.fingerprint !== "string" || raw.fingerprint.length === 0) {
-    return null;
-  }
-
-  return raw.fingerprint;
+export async function listTxIndexKeys(
+  env: Env,
+  limit: number,
+): Promise<{ keys: { name: string }[] }> {
+  return env.CURSOR_KV.list({
+    prefix: TX_INDEX_PREFIX,
+    limit: Math.min(limit, 1000),
+  });
 }
 
 export async function findErrorEntryByTxHash(

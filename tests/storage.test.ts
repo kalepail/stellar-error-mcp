@@ -7,7 +7,7 @@ import {
   storeErrorEntry,
   storeTxHashPointer,
 } from "../src/storage.js";
-import { createTestEnv, MemoryR2Bucket } from "./helpers.js";
+import { createTestEnv, MemoryKV, MemoryR2Bucket } from "./helpers.js";
 
 const baseEntry = {
   fingerprint: "fp-1",
@@ -94,14 +94,19 @@ describe("storage", () => {
     expect(await searchDoc?.text()).toContain("Last seen: 2026-04-02T00:00:00.000Z");
   });
 
-  it("resolves tx hashes only through the direct pointer index", async () => {
+  it("resolves tx hashes through KV pointer index, not R2", async () => {
     const bucket = new MemoryR2Bucket();
-    const env = createTestEnv(bucket);
+    const kv = new MemoryKV();
+    const env = createTestEnv(bucket, kv);
 
     await storeErrorEntry(env, baseEntry);
     expect(await findErrorEntryByTxHash(env, "tx-old")).toBeNull();
 
     await storeTxHashPointer(env, "tx-old", "fp-1");
+
+    // Verify pointer was written to KV, not R2
+    expect(kv.store.get("tx:tx-old")).toBe("fp-1");
+    expect(bucket.objects.has("tx-index/tx-old.json")).toBe(false);
 
     const found = await findErrorEntryByTxHash(env, "tx-old");
     expect(found?.fingerprint).toBe("fp-1");
