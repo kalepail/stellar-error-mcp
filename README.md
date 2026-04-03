@@ -187,10 +187,17 @@ Key constants in `src/index.ts`:
 
 AI Search and analysis models are configured separately in `wrangler.jsonc` under `vars`.
 
-## R2 layout
+## Storage layout
+
+### R2 (`stellar-errors`)
 
 - `errors/<fingerprint>.json`: canonical structured error records
 - `examples/<fingerprint>.json`: stored example transactions and contract snapshots
 - `jobs/<jobId>.json`: async direct-ingest job state and final report payload
 - `tx-index/<txHash>.json`: direct tx-hash to fingerprint pointers
 - `search-docs/<fingerprint>.md`: the only documents intended for AI Search indexing
+
+### KV (`CURSOR_KV`)
+
+- `last_processed_ledger`: ledger cursor for the cron scanner
+- `tx:<txHash>`: transaction hash → fingerprint pointers (value is the fingerprint string)
