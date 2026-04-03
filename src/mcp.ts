@@ -406,7 +406,7 @@ function createBaseServer(env: Env) {
   // List stored error files — useful for Codemode
   server.tool(
     "list_errors",
-    "List deduplicated error entries stored in the R2 database. Returns filenames, sizes, and upload dates.",
+    "List deduplicated error entries stored in R2. Returns filenames, sizes, and upload dates.",
     {
       prefix: z
         .string()
@@ -421,9 +421,12 @@ function createBaseServer(env: Env) {
     },
     async ({ prefix, limit }) => {
       try {
+        const effectivePrefix = prefix ?? "search-docs/";
+        const effectiveLimit = Math.min(limit ?? 100, 1000);
+
         const listed = await env.ERRORS_BUCKET.list({
-          prefix: prefix ?? "search-docs/",
-          limit: Math.min(limit ?? 100, 1000),
+          prefix: effectivePrefix,
+          limit: effectiveLimit,
         });
         return {
           content: [
