@@ -28,7 +28,7 @@ Create these before deploying:
 | R2 Bucket | `stellar-errors` |
 | KV Namespace | any — put the ID in `wrangler.jsonc` |
 | Vectorize Index | `stellar-error-fingerprints` (model: `@cf/baai/bge-base-en-v1.5`) |
-| AI Search | `stellar-errors` (R2-backed, scoped to `/search-docs/**`) |
+| AI Search | `stellar-errors` (R2-backed, scoped to `search-docs/**`) |
 
 ## Setup
 
@@ -36,7 +36,10 @@ Create these before deploying:
 npm install
 ```
 
-Update `wrangler.jsonc` — replace `PLACEHOLDER` with your KV namespace ID.
+Review `wrangler.jsonc` before deploying:
+
+- If you are deploying in a different Cloudflare account, replace `CURSOR_KV.id` with a KV namespace from that account.
+- `wrangler dev` uses local storage by default, so a `preview_id` is not required for normal local development.
 
 Create a `.dev.vars` file with your RPC token:
 
