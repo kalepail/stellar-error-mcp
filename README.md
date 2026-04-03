@@ -1,16 +1,17 @@
 # stellar-error-mcp
 
-A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, deduplicates and analyzes them with AI, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
+A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, accepts direct RPC error submissions for failed `sendTransaction` and `simulateTransaction` calls, deduplicates and analyzes them with AI, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
 
 ## How it works
 
 1. **Scan** — Every 5 minutes, fetches recent ledgers from the Stellar Archive RPC and extracts failed Soroban transactions (invoke, restore, extend operations).
-2. **Fingerprint** — Computes a SHA-256 fingerprint from contracts, function name, error signatures, and result kind. Duplicate errors increment a counter instead of being re-analyzed.
-3. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
-4. **Decode and enrich** — Each failed transaction is normalized into a first-class decoded artifact containing the raw envelope/processing JSON, recursively XDR-decoded views, invoke/auth/resource summaries, operation-level effects, ledger changes, and touched contract IDs.
-5. **Analyze** — Unique errors are sent to a Cloudflare AI model with the full enriched transaction plus contract specs and decoded WASM custom sections, encoded as TOON for high-fidelity LLM input. The model returns a structured analysis: summary, evidence-based classification, likely cause, suggested fix, related codes, debug steps, detailed analysis, and confidence level.
-6. **Store** — Canonical error entries, example transactions, tx-hash pointers, and contract metadata snapshots are persisted to R2. Each error also emits a curated Markdown document under `search-docs/` for AI Search indexing. Vectors are indexed in Vectorize for ingest-time semantic dedup.
-7. **Serve** — An MCP server exposes tools (`diagnose_error`, `get_error`, `get_error_example`, `decode_xdr`) so AI agents can query the knowledge base with natural language or raw XDR blobs.
+2. **Forward** — Internal callers can also submit raw RPC failures directly: pre-consensus `sendTransaction` rejections and failed `simulateTransaction` responses are normalized into the same ingestion pipeline asynchronously.
+3. **Fingerprint** — Computes a SHA-256 fingerprint from contracts, function name, error signatures, and result kind. Duplicate errors increment a counter instead of being re-analyzed.
+4. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
+5. **Decode and enrich** — Each failed transaction is normalized into a first-class decoded artifact containing the raw envelope/processing JSON, recursively XDR-decoded views, invoke/auth/resource summaries, operation-level effects, ledger changes, and touched contract IDs.
+6. **Analyze** — Unique errors are sent to a Cloudflare AI model with the full enriched transaction plus contract specs and decoded WASM custom sections, encoded as TOON for high-fidelity LLM input. The model returns a structured analysis: summary, evidence-based classification, likely cause, suggested fix, related codes, debug steps, detailed analysis, and confidence level.
+7. **Store** — Canonical error entries, example transactions, tx-hash pointers, async direct-ingest job records, and contract metadata snapshots are persisted to R2. Each error also emits a curated Markdown document under `search-docs/` for AI Search indexing. Vectors are indexed in Vectorize for ingest-time semantic dedup.
+8. **Serve** — An MCP server exposes tools (`diagnose_error`, `get_error`, `get_error_example`, `decode_xdr`) so AI agents can query the knowledge base with natural language or raw XDR blobs.
 
 ## Prerequisites
 
@@ -42,6 +43,15 @@ Create a `.dev.vars` file with your RPC token:
 ```
 STELLAR_ARCHIVE_RPC_TOKEN=your_token_here
 ```
+
+Optional real-time RPC settings for Quasar Pro:
+
+```
+STELLAR_RPC_ENDPOINT=https://rpc-pro.lightsail.network
+STELLAR_RPC_AUTH_MODE=header
+```
+
+`STELLAR_ARCHIVE_RPC_TOKEN` is reused for both archive and real-time RPC by default. If you prefer URL-path auth, set `STELLAR_RPC_AUTH_MODE=path`.
 
 For deployed admin endpoints, also set a management token secret:
 
@@ -76,6 +86,47 @@ curl -X POST http://localhost:8787/trigger
 
 For deployed `/trigger` and `/batch` endpoints, send either `Authorization: Bearer <token>` or `x-management-token: <token>`.
 
+Forward a direct RPC error asynchronously:
+
+```bash
+curl -X POST http://localhost:8787/forward-error \
+  -H 'content-type: application/json' \
+  -d '{
+    "kind": "rpc_send",
+    "transactionXdr": "AAAA...",
+    "response": {
+      "status": "ERROR",
+      "hash": "abc123",
+      "latestLedger": 123,
+      "errorResultXdr": "AAAA...",
+      "diagnosticEventsXdr": ["AAAA..."]
+    }
+  }'
+```
+
+Poll the returned job later:
+
+```bash
+curl http://localhost:8787/jobs/job_<id>
+```
+
+Run the live RPC shape-capture suite:
+
+```bash
+export STELLAR_ARCHIVE_RPC_TOKEN=...
+export STELLAR_RPC_ENDPOINT=https://rpc-pro.lightsail.network
+export STELLAR_RPC_AUTH_MODE=header
+npm run test:live-rpc
+```
+
+Optional for networks without Friendbot:
+
+```bash
+export LIVE_RPC_SOURCE_SECRET=SC...
+```
+
+The live suite writes raw and normalized observations to `.context/live-rpc-observations/<network>/` so you can inspect the exact `simulateTransaction`, `sendTransaction`, and `getTransaction` payload shapes returned by the RPC.
+
 ## Deploy
 
 ```bash
@@ -90,6 +141,8 @@ npm run deploy
 | `POST` | `/trigger` | Run one scan cycle |
 | `POST` | `/batch?hours=24` | Backfill a time range (streams NDJSON progress) |
 | `POST` | `/batch?start=N&end=M` | Backfill a specific ledger range |
+| `POST` | `/forward-error` | Queue a direct `rpc_send` or `rpc_simulate` error for async dedupe + analysis |
+| `GET` | `/jobs/:jobId` | Poll a queued direct-ingest job until the error report is ready |
 | `POST` | `/mcp` | MCP protocol endpoint |
 
 ## MCP tools
@@ -138,5 +191,6 @@ AI Search and analysis models are configured separately in `wrangler.jsonc` unde
 
 - `errors/<fingerprint>.json`: canonical structured error records
 - `examples/<fingerprint>.json`: stored example transactions and contract snapshots
+- `jobs/<jobId>.json`: async direct-ingest job state and final report payload
 - `tx-index/<txHash>.json`: direct tx-hash to fingerprint pointers
 - `search-docs/<fingerprint>.md`: the only documents intended for AI Search indexing

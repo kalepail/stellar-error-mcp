@@ -11,6 +11,7 @@ import { createTestEnv, MemoryR2Bucket } from "./helpers.js";
 
 const baseEntry = {
   fingerprint: "fp-1",
+  observationKinds: ["ledger_scan"] as const,
   contractIds: ["CAAAAA"],
   functionName: "transfer",
   errorSignatures: [{ type: "contract", code: "8" }],
@@ -33,6 +34,7 @@ const baseEntry = {
   lastSeen: "2026-04-01T00:00:00.000Z",
   exampleTxHash: "tx-old",
   exampleReadout: {
+    observationKind: "ledger_scan" as const,
     resultKind: "tx_failed",
     feeBump: false,
     invokeCallCount: 1,
@@ -82,12 +84,22 @@ describe("storage", () => {
     });
 
     const entry = await getErrorEntry(env, "fp-1");
-    await bumpErrorEntry(env, entry!, "tx-new", "2026-04-02T00:00:00.000Z");
+    await bumpErrorEntry(
+      env,
+      entry!,
+      "tx-new",
+      "2026-04-02T00:00:00.000Z",
+      "rpc_send",
+    );
 
     const stored = bucket.getJson("errors/fp-1.json") as { txHashes: string[]; seenCount: number };
     expect(stored.txHashes).toHaveLength(50);
     expect(stored.txHashes.at(-1)).toBe("tx-new");
     expect(stored.seenCount).toBe(2);
+    expect((stored as { observationKinds: string[] }).observationKinds).toEqual([
+      "ledger_scan",
+      "rpc_send",
+    ]);
 
     const searchDoc = await bucket.get("search-docs/fp-1.md");
     expect(await searchDoc?.text()).toContain("Occurrences: 2");

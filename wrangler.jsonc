@@ -16,7 +16,7 @@
   "kv_namespaces": [
     {
       "binding": "CURSOR_KV",
-      "id": "PLACEHOLDER"
+      "id": "8ac837a682ce44558a8b8f1337acc998"
     }
   ],
   "vectorize": [
@@ -30,6 +30,8 @@
   },
   "vars": {
     "STELLAR_ARCHIVE_RPC_ENDPOINT": "https://archive-rpc-pro.lightsail.network",
+    "STELLAR_RPC_ENDPOINT": "https://rpc-pro.lightsail.network",
+    "STELLAR_RPC_AUTH_MODE": "header",
     "AI_SEARCH_INSTANCE": "stellar-errors",
     "AI_SEARCH_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     "AI_ANALYSIS_MODEL": "@cf/moonshotai/kimi-k2.5"

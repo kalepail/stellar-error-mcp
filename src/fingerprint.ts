@@ -21,7 +21,9 @@ export async function buildFingerprint(
   const errorSignatures =
     tx.decoded.errorSignatures.length > 0
       ? tx.decoded.errorSignatures
-      : extractErrorSignatures(tx.diagnosticEvents);
+      : extractErrorSignatures(tx.diagnosticEvents).length > 0
+      ? extractErrorSignatures(tx.diagnosticEvents)
+      : buildFallbackSignatures(tx);
 
   // Use primaryContractIds for stable fingerprinting (avoids auth-chain churn),
   // but fall back to full contractIds for non-invoke ops where primary is empty
@@ -40,6 +42,23 @@ export async function buildFingerprint(
   const hash = await sha256(input);
 
   return { fingerprint: hash, functionName, errorSignatures };
+}
+
+function buildFallbackSignatures(tx: FailedTransaction): ErrorSignature[] {
+  const signatures: ErrorSignature[] = [];
+
+  if (tx.resultKind) {
+    signatures.push({ type: "result", code: tx.resultKind });
+  }
+
+  if (tx.readout.simulationError) {
+    signatures.push({
+      type: "simulation",
+      code: tx.readout.simulationError,
+    });
+  }
+
+  return signatures;
 }
 
 /**

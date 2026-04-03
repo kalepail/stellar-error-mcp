@@ -1,29 +1,20 @@
-import type { ContractMetadata, Env, ErrorEntry } from "./types.js";
+import type { DirectErrorJob, DirectErrorSubmission, Env } from "./types.js";
 import { createMcpFetchHandler } from "./mcp.js";
 import { scanForFailedTransactions, getLatestLedger } from "./stellar.js";
 import {
-  getErrorEntry,
-  storeErrorEntry,
-  bumpErrorEntry,
-  storeTxHashPointer,
-  storeExampleTransaction,
-  findSimilarError,
-  indexErrorVector,
+  getDirectErrorJob,
   getLastProcessedLedger,
+  storeDirectErrorJob,
   setLastProcessedLedger,
 } from "./storage.js";
-import { analyzeFailedTransaction } from "./analysis.js";
-import {
-  buildFingerprint,
-  buildErrorDescription,
-} from "./fingerprint.js";
-import {
-  fetchContractsForError,
-  buildContractContext,
-} from "./contracts.js";
 import { SEARCH_DOCS_PREFIX } from "./ai-search.js";
-import { attachDeepDecodedViews } from "./transaction.js";
 import { parsePositiveInteger } from "./input.js";
+import {
+  buildFailedTransactionFromDirectError,
+  buildQueuedDirectErrorJob,
+  parseDirectErrorSubmission,
+} from "./direct.js";
+import { ingestFailedTransaction } from "./ingest.js";
 
 const MAX_LEDGERS_PER_CYCLE = 200;
 const COLD_START_LOOKBACK = 50;
@@ -50,6 +41,14 @@ function logWarn(event: string, fields: Record<string, unknown> = {}): void {
 
 function logError(event: string, fields: Record<string, unknown> = {}): void {
   console.error(JSON.stringify({ level: "error", event, ...fields }));
+}
+
+function randomId(prefix: string): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  const suffix = Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${prefix}${suffix}`;
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -87,10 +86,13 @@ function requireManagementAccess(
   request: Request,
   env: Env,
 ): Response | null {
-  const configuredToken = env.MANAGEMENT_TOKEN?.trim();
+  const configuredTokens = [
+    env.MANAGEMENT_TOKEN?.trim(),
+    env.MANAGEMENT_TOKEN_SECONDARY?.trim(),
+  ].filter((value): value is string => !!value);
   const hostname = new URL(request.url).hostname;
 
-  if (!configuredToken) {
+  if (configuredTokens.length === 0) {
     if (isLoopbackHostname(hostname)) return null;
     return Response.json(
       {
@@ -103,7 +105,10 @@ function requireManagementAccess(
   }
 
   const providedToken = getManagementTokenFromRequest(request);
-  if (!providedToken || !timingSafeEqual(providedToken, configuredToken)) {
+  const authorized = providedToken
+    ? configuredTokens.some((token) => timingSafeEqual(providedToken, token))
+    : false;
+  if (!authorized) {
     return Response.json(
       {
         status: "error",
@@ -115,6 +120,104 @@ function requireManagementAccess(
   }
 
   return null;
+}
+
+function isJobPathname(pathname: string): boolean {
+  return pathname.startsWith("/jobs/") && !pathname.endsWith("/process");
+}
+
+function extractJobIdFromPathname(pathname: string): string {
+  if (pathname.endsWith("/process")) {
+    return pathname.slice("/jobs/".length, -"/process".length).trim();
+  }
+  return pathname.slice("/jobs/".length).trim();
+}
+
+function isJobStale(job: DirectErrorJob, thresholdMs = 30_000): boolean {
+  const updatedAt = Date.parse(job.updatedAt);
+  if (Number.isNaN(updatedAt)) return true;
+  return Date.now() - updatedAt > thresholdMs;
+}
+
+function toPublicJob(job: DirectErrorJob): Omit<DirectErrorJob, "submission"> {
+  const { submission: _submission, ...publicJob } = job;
+  return publicJob;
+}
+
+async function parseJsonBody(request: Request): Promise<unknown> {
+  try {
+    return await request.json();
+  } catch {
+    throw new Error("Request body must be valid JSON.");
+  }
+}
+
+async function updateJob(
+  env: Env,
+  job: DirectErrorJob,
+  patch: Partial<DirectErrorJob>,
+): Promise<DirectErrorJob> {
+  const next: DirectErrorJob = {
+    ...job,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  await storeDirectErrorJob(env, next);
+  return next;
+}
+
+async function processDirectErrorJob(
+  env: Env,
+  job: DirectErrorJob,
+  submission: DirectErrorSubmission,
+): Promise<void> {
+  try {
+    const running = await updateJob(env, job, { status: "processing" });
+    const failedTransaction = await buildFailedTransactionFromDirectError(submission);
+    const result = await ingestFailedTransaction(env, failedTransaction);
+
+    await updateJob(env, running, {
+      status: "completed",
+      sourceReference: failedTransaction.readout.sourceReference ?? failedTransaction.txHash,
+      result: {
+        duplicate: result.status === "duplicate",
+        fingerprint: result.fingerprint,
+        entry: result.entry,
+        example: result.example,
+      },
+    });
+  } catch (error) {
+    await updateJob(env, job, {
+      status: "failed",
+      error: formatError(error),
+    });
+  }
+}
+
+async function processDirectErrorJobById(
+  env: Env,
+  jobId: string,
+): Promise<DirectErrorJob> {
+  const job = await getDirectErrorJob(env, jobId);
+  if (!job) {
+    throw new Error(`Job ${jobId} not found.`);
+  }
+  if (job.status === "completed" || job.status === "failed") {
+    return job;
+  }
+  if (!job.submission) {
+    throw new Error(`Job ${jobId} is missing its stored submission.`);
+  }
+  if (job.status === "processing" && !isJobStale(job)) {
+    return job;
+  }
+
+  await processDirectErrorJob(env, job, job.submission);
+  const refreshed = await getDirectErrorJob(env, jobId);
+  if (!refreshed) {
+    throw new Error(`Job ${jobId} disappeared after processing.`);
+  }
+  return refreshed;
 }
 
 async function processNewLedgers(
@@ -153,140 +256,14 @@ async function processNewLedgers(
 
   let newErrors = 0;
   let duplicates = 0;
-  let similarLinks = 0;
 
   for (const tx of scanResult.transactions) {
-    const { fingerprint, functionName, errorSignatures } =
-      await buildFingerprint(tx);
-
-    // --- Layer 1: Structural fingerprint (exact match) ---
-    const existing = await getErrorEntry(env, fingerprint);
-
-    if (existing) {
-      await bumpErrorEntry(env, existing, tx.txHash, tx.ledgerCloseTime);
+    const result = await ingestFailedTransaction(env, tx);
+    if (result.status === "duplicate") {
       duplicates++;
-      logInfo("scan.duplicate", {
-        fingerprint,
-        txHash: tx.txHash,
-        seenCount: existing.seenCount + 1,
-      });
       continue;
     }
-
-    // --- Layer 2: Vector similarity (semantic match) ---
-    const descriptionContracts = tx.primaryContractIds.length > 0
-      ? tx.primaryContractIds
-      : tx.contractIds;
-    const description = buildErrorDescription(
-      descriptionContracts,
-      functionName,
-      errorSignatures,
-      tx.resultKind,
-    );
-
-    let similarTo: string | undefined;
-    try {
-      const similar = await findSimilarError(env, description);
-      if (similar) {
-        similarTo = similar.fingerprint;
-        similarLinks++;
-        logInfo("scan.similar_match", {
-          fingerprint,
-          similarTo: similar.fingerprint,
-          score: Number(similar.score.toFixed(3)),
-        });
-      }
-    } catch (error) {
-      logWarn("scan.similarity_skipped", { error: formatError(error) });
-    }
-
-    // --- Fetch contract specs for context ---
-    let contracts: Map<string, ContractMetadata> | undefined;
-    let contractContext: string | undefined;
-    if (tx.contractIds.length > 0) {
-      try {
-        contracts = await fetchContractsForError(env, tx.contractIds);
-        contractContext = buildContractContext(contracts);
-      } catch (error) {
-        logWarn("scan.contract_fetch_skipped", {
-          txHash: tx.txHash,
-          error: formatError(error),
-        });
-      }
-    }
-
-    const enrichedTx = {
-      ...tx,
-      decoded: attachDeepDecodedViews(
-        tx.decoded,
-        tx.envelopeJson,
-        tx.processingJson,
-      ),
-    };
-
-    // --- New error: analyze with AI (including contract specs) ---
-    const analysis = await analyzeFailedTransaction(env, enrichedTx, contracts);
-
-    const entry: ErrorEntry = {
-      fingerprint,
-      contractIds: enrichedTx.contractIds,
-      functionName,
-      errorSignatures,
-      resultKind: enrichedTx.resultKind,
-      sorobanOperationTypes: enrichedTx.sorobanOperationTypes,
-      summary: analysis.summary,
-      errorCategory: analysis.errorCategory,
-      likelyCause: analysis.likelyCause,
-      suggestedFix: analysis.suggestedFix,
-      detailedAnalysis: analysis.detailedAnalysis,
-      evidence: analysis.evidence,
-      relatedCodes: analysis.relatedCodes,
-      debugSteps: analysis.debugSteps,
-      confidence: analysis.confidence,
-      modelId: analysis.modelId,
-      seenCount: 1,
-      txHashes: [enrichedTx.txHash],
-      firstSeen: enrichedTx.ledgerCloseTime,
-      lastSeen: enrichedTx.ledgerCloseTime,
-      similarTo,
-      exampleTxHash: enrichedTx.txHash,
-      exampleReadout: enrichedTx.readout,
-      contractContext: contractContext ?? undefined,
-    };
-
-    await storeErrorEntry(env, entry);
-    await storeTxHashPointer(env, enrichedTx.txHash, fingerprint);
-    await storeExampleTransaction(
-      env,
-      enrichedTx,
-      fingerprint,
-      contracts ? [...contracts.values()] : [],
-    );
-
-    // Index in Vectorize for future similarity checks
-    try {
-      await indexErrorVector(env, fingerprint, description, {
-        errorCategory: entry.errorCategory,
-        functionName,
-        contractIds: enrichedTx.contractIds.join(",").slice(0, 200),
-        relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
-      });
-    } catch (error) {
-      logWarn("scan.vector_index_skipped", {
-        fingerprint,
-        error: formatError(error),
-      });
-    }
-
     newErrors++;
-    logInfo("scan.new_error", {
-      fingerprint,
-      txHash: tx.txHash,
-      resultKind: tx.resultKind,
-      errorCategory: entry.errorCategory,
-      confidence: entry.confidence,
-      similarTo: similarTo ?? null,
-    });
   }
 
   if (!opts.skipCursorUpdate) {
@@ -296,7 +273,6 @@ async function processNewLedgers(
   logInfo("scan.cycle_complete", {
     newErrors,
     duplicates,
-    similarLinks,
     lastLedgerProcessed: scanResult.lastLedgerProcessed,
   });
 }
@@ -436,6 +412,89 @@ export default {
       });
     }
 
+    if (url.pathname === "/forward-error" && request.method === "POST") {
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
+      try {
+        const body = await parseJsonBody(request);
+        const submission = parseDirectErrorSubmission(body);
+        const jobId = randomId("job_");
+        const job = buildQueuedDirectErrorJob(jobId, submission);
+        await storeDirectErrorJob(env, job);
+
+        return Response.json(
+          {
+            status: "accepted",
+            jobId,
+            pollUrl: `/jobs/${jobId}`,
+          },
+          { status: 202 },
+        );
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.forward_error_failed", { error: message });
+        return Response.json({ status: "error", message }, { status: 400 });
+      }
+    }
+
+    if (url.pathname.startsWith("/jobs/") && request.method === "POST") {
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
+      if (!url.pathname.endsWith("/process")) {
+        return new Response("Not Found", { status: 404 });
+      }
+
+      const jobId = extractJobIdFromPathname(url.pathname);
+      if (!jobId) {
+        return Response.json(
+          { status: "error", message: "Missing job id." },
+          { status: 400 },
+        );
+      }
+
+      try {
+        const job = await processDirectErrorJobById(env, jobId);
+        return Response.json({
+          status: "ok",
+          job: toPublicJob(job),
+        });
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.job_process_failed", { jobId, error: message });
+        return Response.json({ status: "error", message }, { status: 500 });
+      }
+    }
+
+    if (isJobPathname(url.pathname) && request.method === "GET") {
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
+      const jobId = extractJobIdFromPathname(url.pathname);
+      if (!jobId) {
+        return Response.json(
+          { status: "error", message: "Missing job id." },
+          { status: 400 },
+        );
+      }
+
+      const job = await getDirectErrorJob(env, jobId);
+      if (!job) {
+        return Response.json(
+          { status: "error", message: `Job ${jobId} not found.` },
+          { status: 404 },
+        );
+      }
+
+      if (job.status === "queued" || (job.status === "processing" && isJobStale(job))) {
+        const processed = await processDirectErrorJobById(env, jobId);
+        return Response.json(toPublicJob(processed));
+      }
+
+      return Response.json(toPublicJob(job));
+    }
+
     // Health check
     if (url.pathname === "/" || url.pathname === "/health") {
       const lastLedger = await getLastProcessedLedger(env);
@@ -451,6 +510,8 @@ export default {
           mcp: "/mcp",
           trigger: "/trigger",
           batch: "/batch",
+          forwardError: "/forward-error",
+          jobStatus: "/jobs/:jobId",
           health: "/health",
         },
       });

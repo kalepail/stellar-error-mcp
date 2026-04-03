@@ -4,8 +4,11 @@ export interface Env {
   VECTORIZE: VectorizeIndex;
   AI: Ai;
   MANAGEMENT_TOKEN?: string;
+  MANAGEMENT_TOKEN_SECONDARY?: string;
   STELLAR_ARCHIVE_RPC_TOKEN: string;
   STELLAR_ARCHIVE_RPC_ENDPOINT: string;
+  STELLAR_RPC_ENDPOINT?: string;
+  STELLAR_RPC_AUTH_MODE?: "header" | "path";
   AI_SEARCH_INSTANCE: string;
   AI_SEARCH_MODEL: string;
   AI_ANALYSIS_MODEL: string;
@@ -15,6 +18,11 @@ export interface ErrorSignature {
   type: string; // e.g. "auth", "contract", "wasm"
   code: string; // e.g. "invalid_input", "8", "unreachable"
 }
+
+export type ObservationKind =
+  | "ledger_scan"
+  | "rpc_send"
+  | "rpc_simulate";
 
 export interface TransactionInvokeCall {
   contractId?: unknown;
@@ -107,6 +115,7 @@ export interface ContractMetadata {
 }
 
 export interface FailedTransaction {
+  observationKind: ObservationKind;
   txHash: string;
   ledgerSequence: number;
   ledgerCloseTime: string;
@@ -123,9 +132,11 @@ export interface FailedTransaction {
   processingJson: unknown;
   decoded: DecodedTransactionContext;
   readout: ErrorReadout;
+  sourcePayload?: unknown;
 }
 
 export interface ErrorReadout {
+  observationKind: ObservationKind;
   resultKind: string;
   feeBump: boolean;
   invokeCallCount: number;
@@ -141,11 +152,17 @@ export interface ErrorReadout {
   nonRefundableResourceFeeCharged?: number;
   refundableResourceFeeCharged?: number;
   rentFeeCharged?: number;
+  latestLedger?: number;
+  latestLedgerCloseTime?: number;
+  rpcStatus?: string;
+  simulationError?: string;
+  sourceReference?: string;
 }
 
 // Canonical deduplicated error entry stored in R2
 export interface ErrorEntry {
   fingerprint: string;
+  observationKinds: ObservationKind[];
   contractIds: string[];
   functionName: string;
   errorSignatures: ErrorSignature[];
@@ -203,4 +220,37 @@ export interface ScanResult {
   lastLedgerProcessed: number;
   pagesScanned: number;
   ledgersScanned: number;
+}
+
+export interface DirectErrorSubmission {
+  kind: Exclude<ObservationKind, "ledger_scan">;
+  transactionXdr: string;
+  response: Record<string, unknown>;
+  submittedAt?: string;
+  sourceLabel?: string;
+}
+
+export type DirectErrorJobStatus =
+  | "queued"
+  | "processing"
+  | "completed"
+  | "failed";
+
+export interface DirectErrorJobResult {
+  duplicate: boolean;
+  fingerprint: string;
+  entry: ErrorEntry;
+  example: ExampleTransactionRecord | null;
+}
+
+export interface DirectErrorJob {
+  jobId: string;
+  status: DirectErrorJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  kind: Exclude<ObservationKind, "ledger_scan">;
+  submission?: DirectErrorSubmission;
+  sourceReference?: string;
+  error?: string;
+  result?: DirectErrorJobResult;
 }
