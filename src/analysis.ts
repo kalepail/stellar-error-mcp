@@ -6,7 +6,7 @@ import type {
 } from "./types.js";
 import { encode as encodeToon } from "@toon-format/toon";
 
-const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed Soroban smart contract transaction on the Stellar network.
+const SYSTEM_PROMPT = `You are a Stellar/Soroban blockchain error analysis expert. You will receive data about a failed, rejected, or simulated Soroban smart contract transaction on the Stellar network.
 
 Analyze the failure and respond with a JSON object containing exactly these fields:
 - "summary": A concise 1-2 sentence description of what went wrong
@@ -20,7 +20,8 @@ Analyze the failure and respond with a JSON object containing exactly these fiel
 - "confidence": "high", "medium", or "low" based on how much diagnostic info was available
 
 Analyze ALL available data:
-- The resultKind (transaction-level failure type)
+- The observation kind (ledger failure vs RPC send rejection vs simulation failure)
+- The resultKind (transaction-level or simulation-level failure type)
 - Extracted error signatures: these are normalized from diagnostic events and often expose the HostError family/code or contract error number
 - Function calls: which function was called, with what arguments — check if arguments are invalid (zero amounts, wrong types, out of range)
 - Authorization entries: check signature ledger bounds (valid_until_ledger vs actual ledger), credential types, and auth contexts for sub-contract calls
@@ -46,6 +47,7 @@ function buildUserPrompt(
   const aiPayload = compactForAi({
     transaction: {
       txHash: tx.txHash,
+      observationKind: tx.observationKind,
       ledgerSequence: tx.ledgerSequence,
       ledgerCloseTime: tx.ledgerCloseTime,
       resultKind: tx.resultKind,
@@ -54,6 +56,7 @@ function buildUserPrompt(
       contractIds: tx.contractIds,
       topLevelFunction: tx.decoded.topLevelFunction,
       readout: tx.readout,
+      sourcePayload: tx.sourcePayload ?? null,
     },
     evidence: {
       errorSignatures: tx.decoded.errorSignatures,

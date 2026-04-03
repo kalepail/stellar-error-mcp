@@ -52,6 +52,7 @@ function paragraphSection(title: string, value?: string): string[] {
 export function buildSearchDocument(entry: ErrorEntry): SearchDocumentRecord {
   const primaryContract = entry.contractIds[0] ?? "";
   const operationType = entry.sorobanOperationTypes[0] ?? "";
+  const observationKinds = entry.observationKinds ?? ["ledger_scan"];
   const signatureLines = entry.errorSignatures.map((signature) =>
     `${signature.type}:${signature.code}`
   );
@@ -72,6 +73,7 @@ export function buildSearchDocument(entry: ErrorEntry): SearchDocumentRecord {
     `Primary contract: ${primaryContract || "unknown"}`,
     `Operation type: ${operationType || "unknown"}`,
     `Result kind: ${entry.resultKind}`,
+    `Observation kinds: ${observationKinds.join(", ")}`,
     `Confidence: ${entry.confidence}`,
     `Occurrences: ${entry.seenCount}`,
     `First seen: ${entry.firstSeen}`,

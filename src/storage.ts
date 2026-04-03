@@ -1,17 +1,26 @@
 import type {
+  ActiveRecurringScanRecord,
+  AsyncJob,
+  AsyncJobInput,
   ContractMetadata,
   Env,
   ErrorEntry,
   ErrorReadout,
   ExampleTransactionRecord,
   FailedTransaction,
+  ObservationKind,
 } from "./types.js";
 import { buildSearchDocument } from "./ai-search.js";
 
 const CURSOR_KEY = "last_processed_ledger";
+const ACTIVE_RECURRING_SCAN_KEY = "active_recurring_scan_job";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
 const MAX_TX_HASHES_PER_ENTRY = 50;
+const JOBS_PREFIX = "jobs/";
+const JOB_INPUTS_PREFIX = "job-inputs/";
+const JOB_RESULTS_PREFIX = "job-results/";
+const JOB_STAGING_PREFIX = "job-staging/";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -39,6 +48,26 @@ function normalizeConfidence(
     : "low";
 }
 
+function normalizeObservationKind(
+  value: unknown,
+): ObservationKind {
+  return value === "rpc_send" ||
+      value === "rpc_simulate" ||
+      value === "ledger_scan"
+    ? value
+    : "ledger_scan";
+}
+
+function normalizeObservationKinds(value: unknown): ObservationKind[] {
+  if (!Array.isArray(value)) return ["ledger_scan"];
+
+  const normalized = value
+    .map((item) => normalizeObservationKind(item))
+    .filter((item, index, all) => all.indexOf(item) === index);
+
+  return normalized.length > 0 ? normalized : ["ledger_scan"];
+}
+
 function normalizeErrorReadout(
   value: unknown,
   resultKind: string,
@@ -47,6 +76,7 @@ function normalizeErrorReadout(
   if (!isRecord(value)) return null;
 
   return {
+    observationKind: normalizeObservationKind(value.observationKind),
     resultKind: normalizeString(value.resultKind, resultKind),
     feeBump: value.feeBump === true,
     invokeCallCount: typeof value.invokeCallCount === "number"
@@ -82,6 +112,24 @@ function normalizeErrorReadout(
     rentFeeCharged:
       typeof value.rentFeeCharged === "number"
         ? value.rentFeeCharged
+        : undefined,
+    latestLedger:
+      typeof value.latestLedger === "number"
+        ? value.latestLedger
+        : undefined,
+    latestLedgerCloseTime:
+      typeof value.latestLedgerCloseTime === "number"
+        ? value.latestLedgerCloseTime
+        : undefined,
+    rpcStatus:
+      typeof value.rpcStatus === "string" ? value.rpcStatus : undefined,
+    simulationError:
+      typeof value.simulationError === "string"
+        ? value.simulationError
+        : undefined,
+    sourceReference:
+      typeof value.sourceReference === "string"
+        ? value.sourceReference
         : undefined,
   };
 }
@@ -149,6 +197,7 @@ export function normalizeErrorEntry(
 
   return {
     fingerprint,
+    observationKinds: normalizeObservationKinds(raw.observationKinds),
     contractIds,
     functionName,
     errorSignatures: Array.isArray(raw.errorSignatures)
@@ -225,15 +274,16 @@ export async function storeErrorEntry(
   const key = `errors/${normalized.fingerprint}.json`;
   await env.ERRORS_BUCKET.put(key, JSON.stringify(normalized, null, 2), {
     httpMetadata: { contentType: "application/json" },
-    customMetadata: {
-      fingerprint: normalized.fingerprint,
-      errorCategory: normalized.errorCategory,
-      confidence: normalized.confidence,
-      contractIds: normalized.contractIds.join(",").slice(0, 200),
-      functionName: normalized.functionName,
-      seenCount: String(normalized.seenCount),
-      relatedCodes: normalized.relatedCodes.join(",").slice(0, 200),
-      context: `${normalized.summary} Category: ${normalized.errorCategory}. Codes: ${normalized.relatedCodes.join(", ")}. Function: ${normalized.functionName}`.slice(0, 200),
+      customMetadata: {
+        fingerprint: normalized.fingerprint,
+        errorCategory: normalized.errorCategory,
+        confidence: normalized.confidence,
+        contractIds: normalized.contractIds.join(",").slice(0, 200),
+        functionName: normalized.functionName,
+        observationKinds: normalized.observationKinds.join(","),
+        seenCount: String(normalized.seenCount),
+        relatedCodes: normalized.relatedCodes.join(",").slice(0, 200),
+        context: `${normalized.summary} Category: ${normalized.errorCategory}. Codes: ${normalized.relatedCodes.join(", ")}. Function: ${normalized.functionName}`.slice(0, 200),
     },
   });
   await storeSearchDocument(env, normalized);
@@ -248,11 +298,15 @@ export async function bumpErrorEntry(
   entry: ErrorEntry,
   txHash: string,
   ledgerCloseTime: string,
+  observationKind: ObservationKind,
 ): Promise<void> {
   const normalized = normalizeErrorEntry(entry);
   if (!normalized) return;
 
   normalized.seenCount += 1;
+  normalized.observationKinds = [
+    ...new Set([...normalized.observationKinds, observationKind]),
+  ];
   normalized.txHashes = [...normalized.txHashes.filter((h) => h !== txHash), txHash]
     .slice(-MAX_TX_HASHES_PER_ENTRY);
   normalized.lastSeen = ledgerCloseTime;
@@ -416,4 +470,140 @@ export async function setLastProcessedLedger(
 
 export function resetStorageStateForTests(): void {
   // No-op placeholder for test parity.
+}
+
+export async function storeAsyncJob(
+  env: Env,
+  job: AsyncJob,
+): Promise<void> {
+  await env.ERRORS_BUCKET.put(
+    `${JOBS_PREFIX}${job.jobId}.json`,
+    JSON.stringify(job, null, 2),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        jobId: job.jobId,
+        status: job.status,
+        kind: job.kind,
+        fingerprint:
+          job.result && "fingerprint" in job.result
+            ? job.result.fingerprint
+            : "",
+        sourceReference: job.sourceReference ?? "",
+      },
+    },
+  );
+}
+
+export async function getAsyncJob(
+  env: Env,
+  jobId: string,
+): Promise<AsyncJob | null> {
+  const object = await env.ERRORS_BUCKET.get(`${JOBS_PREFIX}${jobId}.json`);
+  if (!object) return null;
+  return await object.json() as AsyncJob;
+}
+
+export async function storeJobInput(
+  env: Env,
+  jobId: string,
+  input: AsyncJobInput,
+): Promise<void> {
+  await env.ERRORS_BUCKET.put(
+    `${JOB_INPUTS_PREFIX}${jobId}.json`,
+    JSON.stringify(input, null, 2),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
+export async function getJobInput(
+  env: Env,
+  jobId: string,
+): Promise<AsyncJobInput | null> {
+  const object = await env.ERRORS_BUCKET.get(`${JOB_INPUTS_PREFIX}${jobId}.json`);
+  if (!object) return null;
+  return await object.json() as AsyncJobInput;
+}
+
+export async function storeJobResultArtifact(
+  env: Env,
+  jobId: string,
+  payload: unknown,
+): Promise<string> {
+  const key = `${JOB_RESULTS_PREFIX}${jobId}.json`;
+  await env.ERRORS_BUCKET.put(key, JSON.stringify(payload, null, 2), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return key;
+}
+
+export async function storeStagedFailedTransaction(
+  env: Env,
+  jobId: string,
+  txHash: string,
+  transaction: FailedTransaction,
+): Promise<string> {
+  const safeHash = txHash.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const key = `${JOB_STAGING_PREFIX}${jobId}/transactions/${safeHash}.json`;
+  await env.ERRORS_BUCKET.put(key, JSON.stringify(transaction, null, 2), {
+    httpMetadata: { contentType: "application/json" },
+  });
+  return key;
+}
+
+export async function getStagedFailedTransaction(
+  env: Env,
+  key: string,
+): Promise<FailedTransaction | null> {
+  const object = await env.ERRORS_BUCKET.get(key);
+  if (!object) return null;
+  return await object.json() as FailedTransaction;
+}
+
+export async function storeJobStepResult(
+  env: Env,
+  jobId: string,
+  stepName: string,
+  result: unknown,
+): Promise<void> {
+  await env.ERRORS_BUCKET.put(
+    `${JOB_STAGING_PREFIX}${jobId}/step-results/${stepName}.json`,
+    JSON.stringify(result, null, 2),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
+export async function getJobStepResult<T>(
+  env: Env,
+  jobId: string,
+  stepName: string,
+): Promise<T | null> {
+  const object = await env.ERRORS_BUCKET.get(
+    `${JOB_STAGING_PREFIX}${jobId}/step-results/${stepName}.json`,
+  );
+  if (!object) return null;
+  return await object.json() as T;
+}
+
+export async function setActiveRecurringScanRecord(
+  env: Env,
+  record: ActiveRecurringScanRecord | null,
+): Promise<void> {
+  if (!record) {
+    await env.CURSOR_KV.delete(ACTIVE_RECURRING_SCAN_KEY);
+    return;
+  }
+  await env.CURSOR_KV.put(ACTIVE_RECURRING_SCAN_KEY, JSON.stringify(record));
+}
+
+export async function getActiveRecurringScanRecord(
+  env: Env,
+): Promise<ActiveRecurringScanRecord | null> {
+  const value = await env.CURSOR_KV.get(ACTIVE_RECURRING_SCAN_KEY);
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as ActiveRecurringScanRecord;
+  } catch {
+    return null;
+  }
 }

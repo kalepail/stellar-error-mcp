@@ -1,55 +1,44 @@
-import type { ContractMetadata, Env, ErrorEntry } from "./types.js";
+import type { AsyncJob, Env, LedgerRangeWorkflowInput } from "./types.js";
 import { createMcpFetchHandler } from "./mcp.js";
-import { scanForFailedTransactions, getLatestLedger } from "./stellar.js";
-import {
-  getErrorEntry,
-  storeErrorEntry,
-  bumpErrorEntry,
-  storeTxHashPointer,
-  storeExampleTransaction,
-  findSimilarError,
-  indexErrorVector,
-  getLastProcessedLedger,
-  setLastProcessedLedger,
-} from "./storage.js";
-import { analyzeFailedTransaction } from "./analysis.js";
-import {
-  buildFingerprint,
-  buildErrorDescription,
-} from "./fingerprint.js";
-import {
-  fetchContractsForError,
-  buildContractContext,
-} from "./contracts.js";
 import { SEARCH_DOCS_PREFIX } from "./ai-search.js";
-import { attachDeepDecodedViews } from "./transaction.js";
 import { parsePositiveInteger } from "./input.js";
+import { parseDirectErrorSubmission } from "./direct.js";
+import {
+  createInitialJob,
+  createJobId,
+  isTerminalJobStatus,
+  preflightDirectErrorSubmission,
+  updateJob,
+  workflowStatusToAsyncStatus,
+  buildDirectWorkflowInput,
+} from "./jobs.js";
+import {
+  getActiveRecurringScanRecord,
+  getAsyncJob,
+  getLastProcessedLedger,
+  setActiveRecurringScanRecord,
+  storeAsyncJob,
+  storeJobInput,
+  storeStagedFailedTransaction,
+} from "./storage.js";
+import {
+  DirectErrorWorkflow,
+  LedgerRangeWorkflow,
+  syncJobWithWorkflowStatus,
+} from "./workflows.js";
 
-const MAX_LEDGERS_PER_CYCLE = 200;
-const COLD_START_LOOKBACK = 50;
 const MANAGEMENT_TOKEN_HEADER = "x-management-token";
-
-interface ProcessOptions {
-  maxLedgers?: number;
-  startOverride?: number;
-  maxFailed?: number;
-  skipCursorUpdate?: boolean;
-}
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function logInfo(event: string, fields: Record<string, unknown> = {}): void {
-  console.log(JSON.stringify({ level: "info", event, ...fields }));
-}
-
-function logWarn(event: string, fields: Record<string, unknown> = {}): void {
-  console.warn(JSON.stringify({ level: "warn", event, ...fields }));
-}
-
 function logError(event: string, fields: Record<string, unknown> = {}): void {
   console.error(JSON.stringify({ level: "error", event, ...fields }));
+}
+
+function logInfo(event: string, fields: Record<string, unknown> = {}): void {
+  console.log(JSON.stringify({ level: "info", event, ...fields }));
 }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -79,18 +68,20 @@ function getManagementTokenFromRequest(request: Request): string | null {
     }
   }
 
-  const headerToken = request.headers.get(MANAGEMENT_TOKEN_HEADER)?.trim();
-  return headerToken || null;
+  return request.headers.get(MANAGEMENT_TOKEN_HEADER)?.trim() || null;
 }
 
 function requireManagementAccess(
   request: Request,
   env: Env,
 ): Response | null {
-  const configuredToken = env.MANAGEMENT_TOKEN?.trim();
+  const configuredTokens = [
+    env.MANAGEMENT_TOKEN?.trim(),
+    env.MANAGEMENT_TOKEN_SECONDARY?.trim(),
+  ].filter((value): value is string => !!value);
   const hostname = new URL(request.url).hostname;
 
-  if (!configuredToken) {
+  if (configuredTokens.length === 0) {
     if (isLoopbackHostname(hostname)) return null;
     return Response.json(
       {
@@ -103,7 +94,11 @@ function requireManagementAccess(
   }
 
   const providedToken = getManagementTokenFromRequest(request);
-  if (!providedToken || !timingSafeEqual(providedToken, configuredToken)) {
+  const authorized = providedToken
+    ? configuredTokens.some((token) => timingSafeEqual(providedToken, token))
+    : false;
+
+  if (!authorized) {
     return Response.json(
       {
         status: "error",
@@ -117,189 +112,206 @@ function requireManagementAccess(
   return null;
 }
 
-async function processNewLedgers(
-  env: Env,
-  opts: ProcessOptions = {},
-): Promise<void> {
-  const maxLedgers = opts.maxLedgers ?? MAX_LEDGERS_PER_CYCLE;
-  let startLedger = opts.startOverride ?? (await getLastProcessedLedger(env));
+function isJobPathname(pathname: string): boolean {
+  return /^\/jobs\/[^/]+$/.test(pathname);
+}
 
-  if (startLedger === null) {
-    const latest = await getLatestLedger(env);
-    startLedger = latest - COLD_START_LOOKBACK;
-    logInfo("scan.cold_start", { latestLedger: latest, startLedger });
-  } else if (!opts.startOverride) {
-    startLedger += 1;
+function extractJobIdFromPathname(pathname: string): string {
+  return pathname.slice("/jobs/".length).trim();
+}
+
+async function parseJsonBody(request: Request): Promise<unknown> {
+  try {
+    return await request.json();
+  } catch {
+    throw new Error("Request body must be valid JSON.");
   }
+}
 
-  logInfo("scan.start", {
-    startLedger,
-    maxLedgers,
-    maxFailed: opts.maxFailed ?? null,
-  });
+function acceptedJobResponse(
+  request: Request,
+  job: AsyncJob,
+  extras: Record<string, unknown> = {},
+): Response {
+  const pollUrl = new URL(`/jobs/${job.jobId}`, request.url).pathname;
+  return Response.json(
+    {
+      status: "accepted",
+      duplicate: false,
+      jobId: job.jobId,
+      pollUrl,
+      ...extras,
+    },
+    {
+      status: 202,
+      headers: {
+        Location: pollUrl,
+        "Retry-After": "5",
+      },
+    },
+  );
+}
 
-  const scanResult = await scanForFailedTransactions(
+async function createDirectErrorJob(
+  env: Env,
+  preflight: Extract<
+    Awaited<ReturnType<typeof preflightDirectErrorSubmission>>,
+    { duplicate: false }
+  >,
+): Promise<AsyncJob> {
+  const jobId = createJobId("direct_error");
+  const stagedTransactionKey = await storeStagedFailedTransaction(
     env,
-    startLedger,
-    maxLedgers,
-    opts.maxFailed,
+    jobId,
+    preflight.transaction.txHash,
+    preflight.transaction,
+  );
+  const job = createInitialJob(
+    jobId,
+    "direct_error",
+    "accepted",
+    { completed: 0, total: 4, unit: "steps", message: "Direct error accepted." },
+    preflight.sourceReference,
   );
 
-  logInfo("scan.complete_fetch", {
-    ledgersScanned: scanResult.ledgersScanned,
-    pagesScanned: scanResult.pagesScanned,
-    failedTransactions: scanResult.transactions.length,
+  await storeAsyncJob(env, job);
+  await storeJobInput(
+    env,
+    jobId,
+    buildDirectWorkflowInput(jobId, preflight.sourceReference, stagedTransactionKey),
+  );
+
+  const instance = await env.DIRECT_ERROR_WORKFLOW.create({
+    id: jobId,
+    params: { jobId },
   });
+  const details = await instance.status();
 
-  let newErrors = 0;
-  let duplicates = 0;
-  let similarLinks = 0;
+  const next = updateJob(job, {
+    workflowStatus: details.status,
+    status: workflowStatusToAsyncStatus(details.status),
+  });
+  await storeAsyncJob(env, next);
+  return next;
+}
 
-  for (const tx of scanResult.transactions) {
-    const { fingerprint, functionName, errorSignatures } =
-      await buildFingerprint(tx);
+async function createLedgerRangeJob(
+  env: Env,
+  input: LedgerRangeWorkflowInput,
+): Promise<AsyncJob> {
+  const job = createInitialJob(
+    input.jobId,
+    input.kind,
+    "accepted",
+    { completed: 0, unit: "ledgers", message: "Ledger job accepted." },
+  );
 
-    // --- Layer 1: Structural fingerprint (exact match) ---
-    const existing = await getErrorEntry(env, fingerprint);
+  await storeAsyncJob(env, job);
+  await storeJobInput(env, input.jobId, input);
 
-    if (existing) {
-      await bumpErrorEntry(env, existing, tx.txHash, tx.ledgerCloseTime);
-      duplicates++;
-      logInfo("scan.duplicate", {
-        fingerprint,
-        txHash: tx.txHash,
-        seenCount: existing.seenCount + 1,
-      });
-      continue;
-    }
+  const instance = await env.LEDGER_RANGE_WORKFLOW.create({
+    id: input.jobId,
+    params: { jobId: input.jobId },
+  });
+  const details = await instance.status();
 
-    // --- Layer 2: Vector similarity (semantic match) ---
-    const descriptionContracts = tx.primaryContractIds.length > 0
-      ? tx.primaryContractIds
-      : tx.contractIds;
-    const description = buildErrorDescription(
-      descriptionContracts,
-      functionName,
-      errorSignatures,
-      tx.resultKind,
-    );
+  const next = updateJob(job, {
+    workflowStatus: details.status,
+    status: workflowStatusToAsyncStatus(details.status),
+  });
+  await storeAsyncJob(env, next);
 
-    let similarTo: string | undefined;
-    try {
-      const similar = await findSimilarError(env, description);
-      if (similar) {
-        similarTo = similar.fingerprint;
-        similarLinks++;
-        logInfo("scan.similar_match", {
-          fingerprint,
-          similarTo: similar.fingerprint,
-          score: Number(similar.score.toFixed(3)),
-        });
-      }
-    } catch (error) {
-      logWarn("scan.similarity_skipped", { error: formatError(error) });
-    }
-
-    // --- Fetch contract specs for context ---
-    let contracts: Map<string, ContractMetadata> | undefined;
-    let contractContext: string | undefined;
-    if (tx.contractIds.length > 0) {
-      try {
-        contracts = await fetchContractsForError(env, tx.contractIds);
-        contractContext = buildContractContext(contracts);
-      } catch (error) {
-        logWarn("scan.contract_fetch_skipped", {
-          txHash: tx.txHash,
-          error: formatError(error),
-        });
-      }
-    }
-
-    const enrichedTx = {
-      ...tx,
-      decoded: attachDeepDecodedViews(
-        tx.decoded,
-        tx.envelopeJson,
-        tx.processingJson,
-      ),
-    };
-
-    // --- New error: analyze with AI (including contract specs) ---
-    const analysis = await analyzeFailedTransaction(env, enrichedTx, contracts);
-
-    const entry: ErrorEntry = {
-      fingerprint,
-      contractIds: enrichedTx.contractIds,
-      functionName,
-      errorSignatures,
-      resultKind: enrichedTx.resultKind,
-      sorobanOperationTypes: enrichedTx.sorobanOperationTypes,
-      summary: analysis.summary,
-      errorCategory: analysis.errorCategory,
-      likelyCause: analysis.likelyCause,
-      suggestedFix: analysis.suggestedFix,
-      detailedAnalysis: analysis.detailedAnalysis,
-      evidence: analysis.evidence,
-      relatedCodes: analysis.relatedCodes,
-      debugSteps: analysis.debugSteps,
-      confidence: analysis.confidence,
-      modelId: analysis.modelId,
-      seenCount: 1,
-      txHashes: [enrichedTx.txHash],
-      firstSeen: enrichedTx.ledgerCloseTime,
-      lastSeen: enrichedTx.ledgerCloseTime,
-      similarTo,
-      exampleTxHash: enrichedTx.txHash,
-      exampleReadout: enrichedTx.readout,
-      contractContext: contractContext ?? undefined,
-    };
-
-    await storeErrorEntry(env, entry);
-    await storeTxHashPointer(env, enrichedTx.txHash, fingerprint);
-    await storeExampleTransaction(
-      env,
-      enrichedTx,
-      fingerprint,
-      contracts ? [...contracts.values()] : [],
-    );
-
-    // Index in Vectorize for future similarity checks
-    try {
-      await indexErrorVector(env, fingerprint, description, {
-        errorCategory: entry.errorCategory,
-        functionName,
-        contractIds: enrichedTx.contractIds.join(",").slice(0, 200),
-        relatedCodes: entry.relatedCodes.join(",").slice(0, 200),
-      });
-    } catch (error) {
-      logWarn("scan.vector_index_skipped", {
-        fingerprint,
-        error: formatError(error),
-      });
-    }
-
-    newErrors++;
-    logInfo("scan.new_error", {
-      fingerprint,
-      txHash: tx.txHash,
-      resultKind: tx.resultKind,
-      errorCategory: entry.errorCategory,
-      confidence: entry.confidence,
-      similarTo: similarTo ?? null,
+  if (input.kind === "recurring_scan") {
+    await setActiveRecurringScanRecord(env, {
+      jobId: input.jobId,
+      updatedAt: next.updatedAt,
     });
   }
 
-  if (!opts.skipCursorUpdate) {
-    await setLastProcessedLedger(env, scanResult.lastLedgerProcessed);
+  return next;
+}
+
+async function startOrReuseRecurringScanJob(
+  env: Env,
+  initiatedBy: string,
+): Promise<{ job: AsyncJob; reused: boolean }> {
+  const active = await getActiveRecurringScanRecord(env);
+  if (active?.jobId) {
+    const current = await getAsyncJob(env, active.jobId);
+    if (current) {
+      const synced = await syncJobWithWorkflowStatus(env, current);
+      if (!isTerminalJobStatus(synced.status)) {
+        return { job: synced, reused: true };
+      }
+    }
+    await setActiveRecurringScanRecord(env, null);
   }
 
-  logInfo("scan.cycle_complete", {
-    newErrors,
-    duplicates,
-    similarLinks,
-    lastLedgerProcessed: scanResult.lastLedgerProcessed,
-  });
+  const input: LedgerRangeWorkflowInput = {
+    jobId: createJobId("recurring_scan"),
+    kind: "recurring_scan",
+    mode: "recurring",
+    updateCursor: true,
+    initiatedBy,
+  };
+  const job = await createLedgerRangeJob(env, input);
+  return { job, reused: false };
 }
+
+async function getJobStatus(env: Env, jobId: string): Promise<AsyncJob | null> {
+  const existing = await getAsyncJob(env, jobId);
+  if (existing) {
+    if (isTerminalJobStatus(existing.status) && existing.workflowStatus) {
+      return existing;
+    }
+    return syncJobWithWorkflowStatus(env, existing);
+  }
+  return null;
+}
+
+function buildBatchInput(url: URL): LedgerRangeWorkflowInput | Response {
+  const hours = parsePositiveInteger(url.searchParams.get("hours"));
+  const startParam = url.searchParams.get("start");
+  const endParam = url.searchParams.get("end");
+
+  if (startParam && endParam) {
+    const startLedger = parsePositiveInteger(startParam);
+    const endLedger = parsePositiveInteger(endParam);
+    if (startLedger === null || endLedger === null || endLedger <= startLedger) {
+      return Response.json(
+        { error: "Provide numeric start/end values with end > start." },
+        { status: 400 },
+      );
+    }
+    return {
+      jobId: createJobId("ledger_batch"),
+      kind: "ledger_batch",
+      mode: "batch",
+      startLedger,
+      endLedger,
+      updateCursor: false,
+      initiatedBy: "http:batch",
+    };
+  }
+
+  if (hours !== null) {
+    return {
+      jobId: createJobId("ledger_batch"),
+      kind: "ledger_batch",
+      mode: "batch",
+      hours,
+      updateCursor: false,
+      initiatedBy: "http:batch",
+    };
+  }
+
+  return Response.json(
+    { error: "Provide ?hours=N or ?start=N&end=N" },
+    { status: 400 },
+  );
+}
+
+export { DirectErrorWorkflow, LedgerRangeWorkflow };
 
 export default {
   async fetch(
@@ -309,21 +321,49 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
-    // MCP endpoint
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp")) {
       const handler = await createMcpFetchHandler(env);
       return handler(request, env, ctx);
     }
 
-    // Manual trigger for testing the cron pipeline
+    if (url.pathname === "/forward-error" && request.method === "POST") {
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
+      try {
+        const body = await parseJsonBody(request);
+        const submission = parseDirectErrorSubmission(body);
+        const preflight = await preflightDirectErrorSubmission(env, submission);
+
+        if (preflight.duplicate) {
+          return Response.json({
+            status: "duplicate",
+            duplicate: true,
+            sourceReference: preflight.sourceReference,
+            fingerprint: preflight.fingerprint,
+            entry: preflight.entry,
+            example: preflight.example,
+          });
+        }
+
+        const job = await createDirectErrorJob(env, preflight);
+        return acceptedJobResponse(request, job, {
+          sourceReference: preflight.sourceReference,
+        });
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.forward_error_failed", { error: message });
+        return Response.json({ status: "error", message }, { status: 400 });
+      }
+    }
+
     if (url.pathname === "/trigger" && request.method === "POST") {
       const authError = requireManagementAccess(request, env);
       if (authError) return authError;
 
       try {
-        await processNewLedgers(env);
-        const lastLedger = await getLastProcessedLedger(env);
-        return Response.json({ status: "ok", lastProcessedLedger: lastLedger });
+        const { job, reused } = await startOrReuseRecurringScanJob(env, "http:trigger");
+        return acceptedJobResponse(request, job, { reused });
       } catch (error) {
         const message = formatError(error);
         logError("http.trigger_failed", { error: message });
@@ -331,112 +371,48 @@ export default {
       }
     }
 
-    // Batch processing — scan a large range of ledgers
-    // POST /batch?hours=24 or POST /batch?start=61905000&end=61922000
     if (url.pathname === "/batch" && request.method === "POST") {
       const authError = requireManagementAccess(request, env);
       if (authError) return authError;
 
-      const hours = parsePositiveInteger(url.searchParams.get("hours"));
-      const startParam = url.searchParams.get("start");
-      const endParam = url.searchParams.get("end");
+      const input = buildBatchInput(url);
+      if (input instanceof Response) return input;
 
-      let batchStart: number;
-      let batchEnd: number;
+      try {
+        const job = await createLedgerRangeJob(env, input);
+        return acceptedJobResponse(request, job);
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.batch_failed", { error: message });
+        return Response.json({ status: "error", message }, { status: 500 });
+      }
+    }
 
-      if (startParam && endParam) {
-        const parsedStart = parsePositiveInteger(startParam);
-        const parsedEnd = parsePositiveInteger(endParam);
-        if (parsedStart === null || parsedEnd === null || parsedEnd <= parsedStart) {
-          return Response.json(
-            { error: "Provide numeric start/end values with end > start." },
-            { status: 400 },
-          );
-        }
-        batchStart = parsedStart;
-        batchEnd = parsedEnd;
-      } else if (hours !== null) {
-        batchEnd = await getLatestLedger(env);
-        batchStart = batchEnd - Math.floor((hours * 3600) / 5);
-      } else {
+    if (isJobPathname(url.pathname) && request.method === "GET") {
+      const jobId = extractJobIdFromPathname(url.pathname);
+      if (!jobId) {
         return Response.json(
-          { error: "Provide ?hours=N or ?start=N&end=N" },
+          { status: "error", message: "Missing job id." },
           { status: 400 },
         );
       }
 
-      const totalLedgers = batchEnd - batchStart;
-      const CHUNK_SIZE = 200;
-
-      // Stream progress as NDJSON
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
-      const encoder = new TextEncoder();
-
-      const write = async (data: Record<string, unknown>) => {
-        await writer.write(encoder.encode(JSON.stringify(data) + "\n"));
-      };
-
-      ctx.waitUntil(
-        (async () => {
-          try {
-            await write({
-              event: "start",
-              batchStart,
-              batchEnd,
-              totalLedgers,
-            });
-
-            let cursor = batchStart;
-
-            while (cursor < batchEnd) {
-              const chunkLedgers = Math.min(CHUNK_SIZE, batchEnd - cursor);
-              try {
-                await processNewLedgers(env, {
-                  startOverride: cursor,
-                  maxLedgers: chunkLedgers,
-                  maxFailed: 100,
-                  skipCursorUpdate: true,
-                });
-              } catch (error) {
-                const msg = formatError(error);
-                await write({ event: "chunk_error", cursor, error: msg });
-              }
-
-              cursor += chunkLedgers;
-              const progress = (
-                ((cursor - batchStart) / totalLedgers) *
-                100
-              ).toFixed(1);
-              await write({
-                event: "progress",
-                cursor,
-                progress: `${progress}%`,
-              });
-            }
-
-            await write({
-              event: "done",
-              lastLedger: await getLastProcessedLedger(env),
-            });
-          } catch (error) {
-            const msg = formatError(error);
-            await write({ event: "fatal", error: msg });
-          } finally {
-            await writer.close();
-          }
-        })(),
-      );
-
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "application/x-ndjson",
-          "Transfer-Encoding": "chunked",
-        },
-      });
+      try {
+        const job = await getJobStatus(env, jobId);
+        if (!job) {
+          return Response.json(
+            { status: "error", message: `Job ${jobId} not found.` },
+            { status: 404 },
+          );
+        }
+        return Response.json(job);
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.job_status_failed", { jobId, error: message });
+        return Response.json({ status: "error", message }, { status: 500 });
+      }
     }
 
-    // Health check
     if (url.pathname === "/" || url.pathname === "/health") {
       const lastLedger = await getLastProcessedLedger(env);
       return Response.json({
@@ -451,6 +427,8 @@ export default {
           mcp: "/mcp",
           trigger: "/trigger",
           batch: "/batch",
+          forwardError: "/forward-error",
+          jobStatus: "/jobs/:jobId",
           health: "/health",
         },
       });
@@ -464,6 +442,19 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
-    ctx.waitUntil(processNewLedgers(env));
+    ctx.waitUntil(
+      startOrReuseRecurringScanJob(env, "cron")
+        .then(({ job, reused }) => {
+          logInfo("scheduled.recurring_scan_job", {
+            jobId: job.jobId,
+            reused,
+          });
+        })
+        .catch((error) => {
+          logError("scheduled.recurring_scan_failed", {
+            error: formatError(error),
+          });
+        }),
+    );
   },
-} satisfies ExportedHandler<Env>;
+};

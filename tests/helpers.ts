@@ -67,15 +67,68 @@ export class MemoryR2Bucket {
   }
 }
 
+export class MemoryWorkflowBinding<PARAMS = unknown> {
+  readonly created: WorkflowInstanceCreateOptions<PARAMS>[] = [];
+  readonly statuses = new Map<string, InstanceStatus>();
+
+  async create(
+    options: WorkflowInstanceCreateOptions<PARAMS> = {},
+  ): Promise<WorkflowInstance> {
+    const id = options.id ?? `wf_${this.created.length + 1}`;
+    this.created.push({ ...options, id });
+    if (!this.statuses.has(id)) {
+      this.statuses.set(id, { status: "queued" });
+    }
+    return this.get(id);
+  }
+
+  async get(id: string): Promise<WorkflowInstance> {
+    return {
+      id,
+      pause: async () => undefined,
+      resume: async () => undefined,
+      terminate: async () => undefined,
+      restart: async () => undefined,
+      status: async () => this.statuses.get(id) ?? { status: "unknown" },
+      sendEvent: async () => undefined,
+    } as WorkflowInstance;
+  }
+
+  setStatus(id: string, status: InstanceStatus): void {
+    this.statuses.set(id, status);
+  }
+}
+
+export class MemoryKVNamespace {
+  readonly values = new Map<string, string>();
+
+  async get(key: string): Promise<string | null> {
+    return this.values.get(key) ?? null;
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    this.values.set(key, value);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.values.delete(key);
+  }
+}
+
 export function createTestEnv(
   bucket = new MemoryR2Bucket(),
-): Env & { ERRORS_BUCKET: MemoryR2Bucket } {
+): Env & {
+  ERRORS_BUCKET: MemoryR2Bucket;
+  CURSOR_KV: MemoryKVNamespace;
+  DIRECT_ERROR_WORKFLOW: MemoryWorkflowBinding<{ jobId: string }>;
+  LEDGER_RANGE_WORKFLOW: MemoryWorkflowBinding<{ jobId: string }>;
+} {
+  const kv = new MemoryKVNamespace();
+  const directWorkflow = new MemoryWorkflowBinding<{ jobId: string }>();
+  const ledgerWorkflow = new MemoryWorkflowBinding<{ jobId: string }>();
   return {
     ERRORS_BUCKET: bucket,
-    CURSOR_KV: {
-      get: async () => null,
-      put: async () => undefined,
-    } as KVNamespace,
+    CURSOR_KV: kv as unknown as KVNamespace,
     VECTORIZE: {
       query: async () => ({ count: 0, matches: [] }),
       upsert: async () => undefined,
@@ -83,8 +136,16 @@ export function createTestEnv(
     AI: {
       run: async () => ({ data: [[0.1, 0.2, 0.3]] }),
     } as unknown as Ai,
+    DIRECT_ERROR_WORKFLOW: directWorkflow as unknown as Workflow<{
+      jobId: string;
+    }>,
+    LEDGER_RANGE_WORKFLOW: ledgerWorkflow as unknown as Workflow<{
+      jobId: string;
+    }>,
     STELLAR_ARCHIVE_RPC_TOKEN: "token",
-    STELLAR_ARCHIVE_RPC_ENDPOINT: "https://rpc.example.com",
+    STELLAR_ARCHIVE_RPC_ENDPOINT: "https://archive-rpc.example.com",
+    STELLAR_RPC_ENDPOINT: "https://rpc.example.com",
+    STELLAR_RPC_AUTH_MODE: "header",
     AI_SEARCH_INSTANCE: "search",
     AI_SEARCH_MODEL: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     AI_ANALYSIS_MODEL: "@cf/moonshotai/kimi-k2.5",

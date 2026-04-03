@@ -1,5 +1,6 @@
 import type { Env, FailedTransaction, ErrorReadout, ScanResult } from "./types.js";
 import { buildDecodedTransactionContext } from "./transaction.js";
+import { buildRpcUrl, getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
 
 const SOROBAN_OPERATION_KEYS = new Set([
   "invoke_host_function",
@@ -45,15 +46,25 @@ async function fetchLedgerRange(
   limit: number,
   cursor?: string,
 ): Promise<any> {
+  const authMode = getRpcAuthMode(env);
   const payload = buildLedgersPayload(startLedger, limit, cursor);
-  const response = await fetch(env.STELLAR_ARCHIVE_RPC_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.STELLAR_ARCHIVE_RPC_TOKEN}`,
+  const response = await fetch(
+    buildRpcUrl(
+      env.STELLAR_ARCHIVE_RPC_ENDPOINT,
+      env.STELLAR_ARCHIVE_RPC_TOKEN,
+      authMode,
+    ),
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(authMode === "path"
+          ? {}
+          : { Authorization: `Bearer ${env.STELLAR_ARCHIVE_RPC_TOKEN}` }),
+      },
+      body: payload,
     },
-    body: payload,
-  });
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -251,6 +262,7 @@ function buildErrorReadout(
   contractIds: string[],
 ): ErrorReadout {
   const readout: ErrorReadout = {
+    observationKind: "ledger_scan",
     resultKind,
     feeBump: txValue?.tx_fee_bump !== undefined,
     invokeCallCount: invokeCalls.length,
@@ -385,6 +397,7 @@ function extractFailedSorobanTransactions(
         );
 
         failed.push({
+          observationKind: "ledger_scan",
           txHash,
           ledgerSequence: typeof ledgerSequence === "number" ? ledgerSequence : parseInt(ledgerSequence),
           ledgerCloseTime: String(ledgerCloseTime),
@@ -467,31 +480,13 @@ export async function scanForFailedTransactions(
 }
 
 export async function getLatestLedger(env: Env): Promise<number> {
-  // Use the getLatestLedger JSON-RPC method to get the current ledger
-  const response = await fetch(env.STELLAR_ARCHIVE_RPC_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.STELLAR_ARCHIVE_RPC_TOKEN}`,
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 0,
-      method: "getLatestLedger",
-    }),
+  const result = await rpcRequest({
+    endpoint: getRealtimeRpcEndpoint(env),
+    token: env.STELLAR_ARCHIVE_RPC_TOKEN,
+    authMode: getRpcAuthMode(env),
+    method: "getLatestLedger",
   });
 
-  if (!response.ok) {
-    throw new Error(`getLatestLedger HTTP ${response.status}`);
-  }
-
-  const json: any = await response.json();
-  if (json.error) {
-    throw new Error(
-      `getLatestLedger error: ${json.error.message || JSON.stringify(json.error)}`,
-    );
-  }
-
-  const sequence = json.result?.sequence;
+  const sequence = result?.sequence;
   return typeof sequence === "number" ? sequence : parseInt(sequence);
 }
