@@ -113,6 +113,8 @@ describe("direct error normalization", () => {
     const tx = await buildFailedTransactionFromDirectError({
       kind: "rpc_send",
       transactionXdr: "AAAA",
+      submittedAt: "2026-04-03T12:00:00.000Z",
+      sourceLabel: "internal-forwarder",
       response: {
         status: "ERROR",
         hash: "abc123",
@@ -131,6 +133,11 @@ describe("direct error normalization", () => {
     expect(tx.contractIds).toContain(
       "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
     );
+    expect(tx.processingJson).not.toHaveProperty("direct");
+    expect(tx.sourcePayload).toEqual({
+      submittedAt: "2026-04-03T12:00:00.000Z",
+      sourceLabel: "internal-forwarder",
+    });
   });
 
   it("parses rpc simulate failures into failed transactions", async () => {
@@ -155,5 +162,7 @@ describe("direct error normalization", () => {
     expect(tx.decoded.errorSignatures).toEqual([
       { type: "auth", code: "invalid_action" },
     ]);
+    expect(tx.processingJson).not.toHaveProperty("direct");
+    expect(tx.sourcePayload).toBeUndefined();
   });
 });

@@ -28,7 +28,7 @@ Create these before deploying:
 | R2 Bucket | `stellar-errors` |
 | KV Namespace | any — put the ID in `wrangler.jsonc` |
 | Vectorize Index | `stellar-error-fingerprints` (model: `@cf/baai/bge-base-en-v1.5`) |
-| AI Search | `stellar-errors` (R2-backed, scoped to `/search-docs/**`) |
+| AI Search | `stellar-errors` (R2-backed, scoped to `search-docs/**`) |
 | Workflows | `stellar-error-direct`, `stellar-error-ledger-range` |
 
 ## Setup
@@ -37,7 +37,10 @@ Create these before deploying:
 npm install
 ```
 
-Update `wrangler.jsonc` — replace `PLACEHOLDER` with your KV namespace ID.
+Review `wrangler.jsonc` before deploying:
+
+- If you are deploying in a different Cloudflare account, replace the bound resource IDs and names with resources from that account.
+- Keep local preview and production resources separate if you do not want preview traffic writing into the production data plane.
 
 Create a `.dev.vars` file with your RPC token:
 
@@ -112,6 +115,8 @@ If the submission is new, poll the returned job later:
 ```bash
 curl http://localhost:8787/jobs/de_<id>
 ```
+
+The public job response is the only polling surface. There is no `/jobs/:jobId/process` endpoint.
 
 Run the live RPC shape-capture suite:
 

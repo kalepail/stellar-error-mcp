@@ -8,6 +8,7 @@ import {
   findErrorEntryByTxHash,
 } from "./storage.js";
 import { buildAiSearchFilters } from "./ai-search.js";
+import { sanitizeExampleTransaction } from "./jobs.js";
 import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
 
 function createBaseServer(env: Env) {
@@ -144,7 +145,9 @@ function createBaseServer(env: Env) {
               ],
             };
           }
-          const example = await getExampleTransaction(env, fingerprint);
+          const example = sanitizeExampleTransaction(
+            await getExampleTransaction(env, fingerprint),
+          );
           return {
             content: [
               {
@@ -158,9 +161,8 @@ function createBaseServer(env: Env) {
         // Search by tx_hash across paginated error entries (batched reads)
         const foundEntry = await findErrorEntryByTxHash(env, tx_hash!);
         if (foundEntry) {
-          const example = await getExampleTransaction(
-            env,
-            foundEntry.fingerprint,
+          const example = sanitizeExampleTransaction(
+            await getExampleTransaction(env, foundEntry.fingerprint),
           );
           return {
             content: [
@@ -205,7 +207,9 @@ function createBaseServer(env: Env) {
     },
     async ({ fingerprint }) => {
       try {
-        const example = await getExampleTransaction(env, fingerprint);
+        const example = sanitizeExampleTransaction(
+          await getExampleTransaction(env, fingerprint),
+        );
         if (!example) {
           return {
             content: [

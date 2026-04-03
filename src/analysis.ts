@@ -56,7 +56,6 @@ function buildUserPrompt(
       contractIds: tx.contractIds,
       topLevelFunction: tx.decoded.topLevelFunction,
       readout: tx.readout,
-      sourcePayload: tx.sourcePayload ?? null,
     },
     evidence: {
       errorSignatures: tx.decoded.errorSignatures,
