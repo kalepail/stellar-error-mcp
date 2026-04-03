@@ -14,6 +14,7 @@ import { buildSearchDocument } from "./ai-search.js";
 
 const CURSOR_KEY = "last_processed_ledger";
 const ACTIVE_RECURRING_SCAN_KEY = "active_recurring_scan_job";
+const ACTIVE_DIRECT_JOB_PREFIX = "active_direct_job:";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
 const MAX_TX_HASHES_PER_ENTRY = 50;
@@ -606,4 +607,24 @@ export async function getActiveRecurringScanRecord(
   } catch {
     return null;
   }
+}
+
+export async function setActiveDirectJob(
+  env: Env,
+  txHash: string,
+  jobId: string | null,
+): Promise<void> {
+  const key = `${ACTIVE_DIRECT_JOB_PREFIX}${txHash}`;
+  if (!jobId) {
+    await env.CURSOR_KV.delete(key);
+    return;
+  }
+  await env.CURSOR_KV.put(key, jobId);
+}
+
+export async function getActiveDirectJob(
+  env: Env,
+  txHash: string,
+): Promise<string | null> {
+  return env.CURSOR_KV.get(`${ACTIVE_DIRECT_JOB_PREFIX}${txHash}`);
 }

@@ -190,6 +190,7 @@ describe("workflow classes", () => {
       jobId: "de_staged",
       sourceReference: "rpcsend-1",
       stagedTransactionKey,
+      txHash: tx.txHash,
     });
 
     const { DirectErrorWorkflow } = await import("../src/workflows.js");

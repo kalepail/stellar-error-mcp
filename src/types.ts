@@ -313,6 +313,7 @@ export interface DirectErrorWorkflowInput {
   jobId: string;
   sourceReference: string;
   stagedTransactionKey: string;
+  txHash: string;
 }
 
 export type LedgerRangeJobMode = "batch" | "recurring";

@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestEnv } from "./helpers.js";
-import { storeAsyncJob, setActiveRecurringScanRecord } from "../src/storage.js";
+import {
+  setActiveDirectJob,
+  setActiveRecurringScanRecord,
+  storeAsyncJob,
+} from "../src/storage.js";
 import type { AsyncJob } from "../src/types.js";
 
 const { preflightDirectErrorSubmission } = vi.hoisted(() => ({
@@ -65,10 +69,12 @@ vi.mock("../src/jobs.js", async () => {
       jobId: string,
       sourceReference: string,
       stagedTransactionKey: string,
+      txHash: string,
     ) => ({
       jobId,
       sourceReference,
       stagedTransactionKey,
+      txHash,
     }),
   };
 });
@@ -166,6 +172,52 @@ describe("worker fetch routes", () => {
       jobId: expect.stringMatching(/^de_/),
     });
     expect(env.DIRECT_ERROR_WORKFLOW.created).toHaveLength(1);
+  });
+
+  it("reuses an active direct error job for the same tx hash", async () => {
+    preflightDirectErrorSubmission.mockResolvedValue({
+      duplicate: false,
+      transaction: { txHash: "tx-inflight" },
+      fingerprint: "fp-new",
+      sourceReference: "rpcsend-1",
+    });
+
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "de_inflight",
+      kind: "direct_error",
+      status: "running",
+      phase: "analyzing",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:01:00.000Z",
+      progress: { completed: 3, total: 4, unit: "steps" },
+      sourceReference: "rpcsend-1",
+      workflowStatus: "running",
+    };
+    await storeAsyncJob(env, job);
+    await setActiveDirectJob(env, "tx-inflight", job.jobId);
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/forward-error", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: "rpc_send",
+          transactionXdr: "AAAA",
+          response: { status: "ERROR" },
+        }),
+      }),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      jobId: "de_inflight",
+      reused: true,
+    });
+    expect(env.DIRECT_ERROR_WORKFLOW.created).toHaveLength(0);
   });
 
   it("serves public job status without exposing stored submission input", async () => {

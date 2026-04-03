@@ -4,11 +4,13 @@ import { NonRetryableError } from "cloudflare:workflows";
 import { ingestFailedTransaction } from "./ingest.js";
 import { updateJob, sanitizeExampleTransaction, workflowStatusToAsyncStatus } from "./jobs.js";
 import {
+  getActiveDirectJob,
   getActiveRecurringScanRecord,
   getAsyncJob,
   getJobInput,
   getJobStepResult,
   getStagedFailedTransaction,
+  setActiveDirectJob,
   setActiveRecurringScanRecord,
   storeAsyncJob,
   storeJobResultArtifact,
@@ -76,7 +78,7 @@ function ensureDirectInput(
     throw new NonRetryableError(`Direct workflow input missing for ${jobId}.`);
   }
   const record = input as Partial<DirectErrorWorkflowInput>;
-  if (!record.sourceReference || !record.stagedTransactionKey) {
+  if (!record.sourceReference || !record.stagedTransactionKey || !record.txHash) {
     throw new NonRetryableError(`Direct workflow input malformed for ${jobId}.`);
   }
   return record as DirectErrorWorkflowInput;
@@ -118,6 +120,17 @@ async function clearRecurringScanIfNeeded(
   const active = await getActiveRecurringScanRecord(env);
   if (active?.jobId === jobId) {
     await setActiveRecurringScanRecord(env, null);
+  }
+}
+
+async function clearDirectJobIfNeeded(
+  env: Env,
+  txHash: string,
+  jobId: string,
+): Promise<void> {
+  const activeJobId = await getActiveDirectJob(env, txHash);
+  if (activeJobId === jobId) {
+    await setActiveDirectJob(env, txHash, null);
   }
 }
 
@@ -309,6 +322,7 @@ export class DirectErrorWorkflow extends WorkflowEntrypoint<
           progress: { completed: 4, total: 4, unit: "steps", message: "Direct error workflow completed." },
           result,
         });
+        await clearDirectJobIfNeeded(this.env, input.txHash, jobId);
         return null;
       });
 
@@ -320,6 +334,10 @@ export class DirectErrorWorkflow extends WorkflowEntrypoint<
     } catch (error) {
       await step.do("finalize-direct-failure", async () => {
         await finalizeFailedJob(this.env, jobId, error);
+        const input = await getJobInput(this.env, jobId);
+        if (input && typeof input === "object" && "txHash" in input && typeof input.txHash === "string") {
+          await clearDirectJobIfNeeded(this.env, input.txHash, jobId);
+        }
         return null;
       });
       throw error;

@@ -13,9 +13,11 @@ import {
   buildDirectWorkflowInput,
 } from "./jobs.js";
 import {
+  getActiveDirectJob,
   getActiveRecurringScanRecord,
   getAsyncJob,
   getLastProcessedLedger,
+  setActiveDirectJob,
   setActiveRecurringScanRecord,
   storeAsyncJob,
   storeJobInput,
@@ -178,8 +180,14 @@ async function createDirectErrorJob(
   await storeJobInput(
     env,
     jobId,
-    buildDirectWorkflowInput(jobId, preflight.sourceReference, stagedTransactionKey),
+    buildDirectWorkflowInput(
+      jobId,
+      preflight.sourceReference,
+      stagedTransactionKey,
+      preflight.transaction.txHash,
+    ),
   );
+  await setActiveDirectJob(env, preflight.transaction.txHash, jobId);
 
   const instance = await env.DIRECT_ERROR_WORKFLOW.create({
     id: jobId,
@@ -193,6 +201,29 @@ async function createDirectErrorJob(
   });
   await storeAsyncJob(env, next);
   return next;
+}
+
+async function createOrReuseDirectErrorJob(
+  env: Env,
+  preflight: Extract<
+    Awaited<ReturnType<typeof preflightDirectErrorSubmission>>,
+    { duplicate: false }
+  >,
+): Promise<{ job: AsyncJob; reused: boolean }> {
+  const activeJobId = await getActiveDirectJob(env, preflight.transaction.txHash);
+  if (activeJobId) {
+    const current = await getAsyncJob(env, activeJobId);
+    if (current) {
+      const synced = await syncJobWithWorkflowStatus(env, current);
+      if (!isTerminalJobStatus(synced.status)) {
+        return { job: synced, reused: true };
+      }
+    }
+    await setActiveDirectJob(env, preflight.transaction.txHash, null);
+  }
+
+  const job = await createDirectErrorJob(env, preflight);
+  return { job, reused: false };
 }
 
 async function createLedgerRangeJob(
@@ -346,9 +377,10 @@ export default {
           });
         }
 
-        const job = await createDirectErrorJob(env, preflight);
+        const { job, reused } = await createOrReuseDirectErrorJob(env, preflight);
         return acceptedJobResponse(request, job, {
           sourceReference: preflight.sourceReference,
+          reused,
         });
       } catch (error) {
         const message = formatError(error);

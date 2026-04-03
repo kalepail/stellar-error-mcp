@@ -229,10 +229,12 @@ export function buildDirectWorkflowInput(
   jobId: string,
   sourceReference: string,
   stagedTransactionKey: string,
+  txHash: string,
 ): DirectErrorWorkflowInput {
   return {
     jobId,
     sourceReference,
     stagedTransactionKey,
+    txHash,
   };
 }
