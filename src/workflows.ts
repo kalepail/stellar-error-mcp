@@ -47,7 +47,7 @@ function buildChunkStepName(startLedger: number, endLedger: number): string {
 }
 
 function buildIngestStepName(txHash: string): string {
-  const safe = txHash.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48);
+  const safe = txHash.replace(/[^a-zA-Z0-9_-]/g, "_");
   return `ingest-tx-${safe}`;
 }
 

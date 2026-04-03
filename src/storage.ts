@@ -15,6 +15,7 @@ import { buildSearchDocument } from "./ai-search.js";
 const CURSOR_KEY = "last_processed_ledger";
 const ACTIVE_RECURRING_SCAN_KEY = "active_recurring_scan_job";
 const ACTIVE_DIRECT_JOB_PREFIX = "active_direct_job:";
+const LEGACY_TX_INDEX_PREFIX = "tx:";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
 const MAX_TX_HASHES_PER_ENTRY = 50;
@@ -22,6 +23,10 @@ const JOBS_PREFIX = "jobs/";
 const JOB_INPUTS_PREFIX = "job-inputs/";
 const JOB_RESULTS_PREFIX = "job-results/";
 const JOB_STAGING_PREFIX = "job-staging/";
+
+function txIndexObjectKey(txHash: string): string {
+  return `tx-index/${txHash}.json`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -321,28 +326,41 @@ export async function storeTxHashPointer(
   fingerprint: string,
 ): Promise<void> {
   await env.ERRORS_BUCKET.put(
-    `tx-index/${txHash}.json`,
+    txIndexObjectKey(txHash),
     JSON.stringify({ fingerprint }, null, 2),
     {
       httpMetadata: { contentType: "application/json" },
       customMetadata: { txHash, fingerprint },
     },
   );
+  await env.CURSOR_KV.put(`${LEGACY_TX_INDEX_PREFIX}${txHash}`, fingerprint);
 }
 
 export async function getFingerprintByTxHash(
   env: Env,
   txHash: string,
 ): Promise<string | null> {
-  const object = await env.ERRORS_BUCKET.get(`tx-index/${txHash}.json`);
-  if (!object) return null;
-
-  const raw = await object.json();
-  if (!isRecord(raw) || typeof raw.fingerprint !== "string" || raw.fingerprint.length === 0) {
-    return null;
+  const object = await env.ERRORS_BUCKET.get(txIndexObjectKey(txHash));
+  if (object) {
+    const raw = await object.json();
+    if (isRecord(raw) && typeof raw.fingerprint === "string" && raw.fingerprint.length > 0) {
+      return raw.fingerprint;
+    }
   }
 
-  return raw.fingerprint;
+  const legacy = await env.CURSOR_KV.get(`${LEGACY_TX_INDEX_PREFIX}${txHash}`);
+  if (!legacy) return null;
+
+  // Backfill the new R2 index lazily so older deployments keep exact-dedupe behavior.
+  await env.ERRORS_BUCKET.put(
+    txIndexObjectKey(txHash),
+    JSON.stringify({ fingerprint: legacy }, null, 2),
+    {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: { txHash, fingerprint: legacy },
+    },
+  );
+  return legacy;
 }
 
 export async function findErrorEntryByTxHash(

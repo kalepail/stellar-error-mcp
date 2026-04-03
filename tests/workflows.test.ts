@@ -280,6 +280,73 @@ describe("workflow classes", () => {
     ).toBe(true);
   });
 
+  it("ingests each staged transaction even when hashes differ only after a shared prefix", async () => {
+    const env = createTestEnv();
+    const tx1 = createFailedTx(`${"a".repeat(48)}1111111111111111`);
+    const tx2 = createFailedTx(`${"a".repeat(48)}2222222222222222`);
+    scanForFailedTransactions.mockResolvedValue({
+      transactions: [tx1, tx2],
+      lastLedgerProcessed: 19,
+      pagesScanned: 1,
+      ledgersScanned: 10,
+    });
+    ingestFailedTransaction.mockResolvedValue({
+      status: "new",
+      fingerprint: "fp-1",
+      entry: { fingerprint: "fp-1" },
+      example: null,
+    });
+
+    await storeAsyncJob(env, {
+      jobId: "lb_collisions",
+      kind: "ledger_batch",
+      status: "queued",
+      phase: "accepted",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:00:00.000Z",
+      progress: { completed: 0, unit: "ledgers" },
+    });
+    await storeJobInput(env, "lb_collisions", {
+      jobId: "lb_collisions",
+      kind: "ledger_batch",
+      mode: "batch",
+      startLedger: 10,
+      endLedger: 20,
+      updateCursor: false,
+      initiatedBy: "test",
+    });
+
+    const { LedgerRangeWorkflow } = await import("../src/workflows.js");
+    const workflow = new LedgerRangeWorkflow(
+      { waitUntil: () => undefined } as ExecutionContext,
+      env,
+    );
+    const recorder = createStepRecorder();
+
+    await workflow.run(
+      {
+        payload: { jobId: "lb_collisions" },
+        timestamp: new Date(),
+        instanceId: "lb_collisions",
+      },
+      recorder.step,
+    );
+
+    expect(ingestFailedTransaction).toHaveBeenCalledTimes(2);
+    expect(ingestFailedTransaction).toHaveBeenNthCalledWith(
+      1,
+      env,
+      expect.objectContaining({ txHash: tx1.txHash }),
+    );
+    expect(ingestFailedTransaction).toHaveBeenNthCalledWith(
+      2,
+      env,
+      expect.objectContaining({ txHash: tx2.txHash }),
+    );
+    expect(recorder.names).toContain(`ingest-tx-${tx1.txHash}`);
+    expect(recorder.names).toContain(`ingest-tx-${tx2.txHash}`);
+  });
+
   it("updates the cursor only after a successful recurring scan", async () => {
     const env = createTestEnv();
     await env.CURSOR_KV.put("last_processed_ledger", "10");
