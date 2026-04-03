@@ -19,6 +19,8 @@ import { ingestFailedTransaction } from "./ingest.js";
 const MAX_LEDGERS_PER_CYCLE = 200;
 const COLD_START_LOOKBACK = 50;
 const MANAGEMENT_TOKEN_HEADER = "x-management-token";
+const DIRECT_JOB_ID_PATTERN = /^job_[a-f0-9]{16}$/;
+const DIRECT_JOB_STALE_MS = 10 * 60 * 1000;
 
 interface ProcessOptions {
   maxLedgers?: number;
@@ -133,7 +135,11 @@ function extractJobIdFromPathname(pathname: string): string {
   return pathname.slice("/jobs/".length).trim();
 }
 
-function isJobStale(job: DirectErrorJob, thresholdMs = 30_000): boolean {
+function isValidDirectJobId(jobId: string): boolean {
+  return DIRECT_JOB_ID_PATTERN.test(jobId);
+}
+
+function isJobStale(job: DirectErrorJob, thresholdMs = DIRECT_JOB_STALE_MS): boolean {
   const updatedAt = Date.parse(job.updatedAt);
   if (Number.isNaN(updatedAt)) return true;
   return Date.now() - updatedAt > thresholdMs;
@@ -218,6 +224,21 @@ async function processDirectErrorJobById(
     throw new Error(`Job ${jobId} disappeared after processing.`);
   }
   return refreshed;
+}
+
+function enqueueDirectErrorJob(
+  env: Env,
+  ctx: ExecutionContext,
+  jobId: string,
+): void {
+  ctx.waitUntil(
+    processDirectErrorJobById(env, jobId).catch((error) => {
+      logError("job.background_process_failed", {
+        jobId,
+        error: formatError(error),
+      });
+    }),
+  );
 }
 
 async function processNewLedgers(
@@ -422,12 +443,14 @@ export default {
         const jobId = randomId("job_");
         const job = buildQueuedDirectErrorJob(jobId, submission);
         await storeDirectErrorJob(env, job);
+        enqueueDirectErrorJob(env, ctx, jobId);
 
         return Response.json(
           {
             status: "accepted",
             jobId,
             pollUrl: `/jobs/${jobId}`,
+            processUrl: `/jobs/${jobId}/process`,
           },
           { status: 202 },
         );
@@ -453,13 +476,16 @@ export default {
           { status: 400 },
         );
       }
+      if (!isValidDirectJobId(jobId)) {
+        return Response.json(
+          { status: "error", message: "Invalid job id." },
+          { status: 400 },
+        );
+      }
 
       try {
         const job = await processDirectErrorJobById(env, jobId);
-        return Response.json({
-          status: "ok",
-          job: toPublicJob(job),
-        });
+        return Response.json(toPublicJob(job));
       } catch (error) {
         const message = formatError(error);
         logError("http.job_process_failed", { jobId, error: message });
@@ -478,6 +504,12 @@ export default {
           { status: 400 },
         );
       }
+      if (!isValidDirectJobId(jobId)) {
+        return Response.json(
+          { status: "error", message: "Invalid job id." },
+          { status: 400 },
+        );
+      }
 
       const job = await getDirectErrorJob(env, jobId);
       if (!job) {
@@ -485,11 +517,6 @@ export default {
           { status: "error", message: `Job ${jobId} not found.` },
           { status: 404 },
         );
-      }
-
-      if (job.status === "queued" || (job.status === "processing" && isJobStale(job))) {
-        const processed = await processDirectErrorJobById(env, jobId);
-        return Response.json(toPublicJob(processed));
       }
 
       return Response.json(toPublicJob(job));

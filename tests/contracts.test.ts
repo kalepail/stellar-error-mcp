@@ -85,4 +85,38 @@ describe("contracts cache", () => {
     expect(second).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("normalizes multiline contract docs before building context", async () => {
+    const {
+      buildContractContext,
+    } = await import("../src/contracts.js");
+
+    const context = buildContractContext(new Map([
+      [makeContractId(), {
+        contractId: makeContractId(),
+        wasmHash: "abc",
+        functions: [{
+          name: "transfer",
+          doc: "  First line.\nSecond line.\n\nThird line with extra spacing.  ",
+          inputs: [{ name: "to", type: "Address" }],
+          outputs: ["Result"],
+        }],
+        errorEnums: [{
+          name: "Error",
+          cases: [{
+            name: "BadInput",
+            value: 1,
+            doc: "line one\nline two",
+          }],
+        }],
+        structs: [],
+        fetchedAt: "2026-04-02T00:00:00.000Z",
+      }],
+    ]));
+
+    expect(context).toContain("/// First line. Second line. Third line with extra spacing.");
+    expect(context).toContain("1 = BadInput  // line one line two");
+    expect(context).not.toContain("\nSecond line.");
+    expect(context).not.toContain("line one\nline two");
+  });
 });

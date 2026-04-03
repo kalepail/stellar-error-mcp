@@ -1,8 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestEnv } from "./helpers.js";
 
-const storeDirectErrorJob = vi.fn(async () => undefined);
-const getDirectErrorJob = vi.fn(async () => null);
+let storedJob: Record<string, unknown> | null = null;
+
+const storeDirectErrorJob = vi.fn(async (_env: unknown, job: Record<string, unknown>) => {
+  storedJob = job;
+});
+const getDirectErrorJob = vi.fn(async (_env: unknown, jobId: string) => {
+  return storedJob?.jobId === jobId ? storedJob : null;
+});
 
 vi.mock("../src/mcp.js", () => ({
   createMcpFetchHandler: async () => () => new Response("mock mcp"),
@@ -33,6 +39,7 @@ vi.mock("../src/direct.js", () => ({
     createdAt: "2026-04-02T00:00:00.000Z",
     updatedAt: "2026-04-02T00:00:00.000Z",
     kind: submission.kind,
+    submission,
   }),
   buildFailedTransactionFromDirectError: async () => ({
     observationKind: "rpc_send",
@@ -120,9 +127,12 @@ vi.mock("../src/ingest.js", () => ({
 
 describe("worker fetch smoke", () => {
   beforeEach(() => {
+    storedJob = null;
     storeDirectErrorJob.mockClear();
     getDirectErrorJob.mockReset();
-    getDirectErrorJob.mockResolvedValue(null);
+    getDirectErrorJob.mockImplementation(async (_env: unknown, jobId: string) => {
+      return storedJob?.jobId === jobId ? storedJob : null;
+    });
   });
 
   it("serves a health document aligned with the v1 architecture", async () => {
@@ -155,6 +165,9 @@ describe("worker fetch smoke", () => {
   });
 
   it("accepts direct error submissions and returns a poll URL", async () => {
+    const waitUntil = vi.fn((promise: Promise<unknown>) => {
+      void promise.catch(() => undefined);
+    });
     const { default: worker } = await import("../src/index.js");
     const response = await worker.fetch(
       new Request("http://localhost/forward-error", {
@@ -168,7 +181,7 @@ describe("worker fetch smoke", () => {
       }),
       createTestEnv(),
       {
-        waitUntil: () => undefined,
+        waitUntil,
       } as ExecutionContext,
     );
 
@@ -176,13 +189,15 @@ describe("worker fetch smoke", () => {
     await expect(response.json()).resolves.toMatchObject({
       status: "accepted",
       pollUrl: expect.stringMatching(/^\/jobs\/job_/),
+      processUrl: expect.stringMatching(/^\/jobs\/job_[a-f0-9]{16}\/process$/),
     });
     expect(storeDirectErrorJob).toHaveBeenCalled();
+    expect(waitUntil).toHaveBeenCalledTimes(1);
   });
 
   it("returns stored direct job state", async () => {
     getDirectErrorJob.mockResolvedValue({
-      jobId: "job_123",
+      jobId: "job_1234567890abcdef",
       status: "completed",
       createdAt: "2026-04-02T00:00:00.000Z",
       updatedAt: "2026-04-02T00:01:00.000Z",
@@ -197,7 +212,7 @@ describe("worker fetch smoke", () => {
 
     const { default: worker } = await import("../src/index.js");
     const response = await worker.fetch(
-      new Request("http://localhost/jobs/job_123"),
+      new Request("http://localhost/jobs/job_1234567890abcdef"),
       createTestEnv(),
       {
         waitUntil: () => undefined,
@@ -206,12 +221,54 @@ describe("worker fetch smoke", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      jobId: "job_123",
+      jobId: "job_1234567890abcdef",
       status: "completed",
       result: {
         duplicate: true,
         fingerprint: "fp-1",
       },
+    });
+  });
+
+  it("does not process queued jobs inline during GET polling", async () => {
+    getDirectErrorJob.mockResolvedValue({
+      jobId: "job_1234567890abcdef",
+      status: "queued",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:00:00.000Z",
+      kind: "rpc_send",
+    });
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/jobs/job_1234567890abcdef"),
+      createTestEnv(),
+      {
+        waitUntil: () => undefined,
+      } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      jobId: "job_1234567890abcdef",
+      status: "queued",
+    });
+  });
+
+  it("rejects invalid direct job ids", async () => {
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/jobs/not-a-real-job"),
+      createTestEnv(),
+      {
+        waitUntil: () => undefined,
+      } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "error",
+      message: "Invalid job id.",
     });
   });
 

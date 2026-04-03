@@ -25,6 +25,7 @@ type MemoryCacheValue =
 const memoryCache = new Map<string, MemoryCacheValue>();
 
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const MAX_CONTEXT_DOC_LENGTH = 240;
 const CONTRACT_SECTION_TYPES = {
   contractspecv0: "ScSpecEntry",
   contractmetav0: "ScMetaEntry",
@@ -554,7 +555,8 @@ export function buildContractContext(
       for (const e of meta.errorEnums) {
         parts.push(`    enum ${e.name} {`);
         for (const c of e.cases) {
-          const docStr = c.doc ? `  // ${c.doc}` : "";
+          const doc = normalizeContextDoc(c.doc);
+          const docStr = doc ? `  // ${doc}` : "";
           parts.push(`      ${c.value} = ${c.name}${docStr}`);
         }
         parts.push("    }");
@@ -569,8 +571,9 @@ export function buildContractContext(
           .join(", ");
         const ret =
           fn.outputs.length > 0 ? ` -> ${fn.outputs.join(", ")}` : "";
-        if (fn.doc) {
-          parts.push(`    /// ${fn.doc}`);
+        const doc = normalizeContextDoc(fn.doc);
+        if (doc) {
+          parts.push(`    /// ${doc}`);
         }
         parts.push(`    ${fn.name}(${params})${ret}`);
       }
@@ -610,6 +613,15 @@ export function buildContractContext(
   }
 
   return parts.join("\n");
+}
+
+function normalizeContextDoc(doc?: string): string {
+  if (!doc) return "";
+
+  const collapsed = doc.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  if (collapsed.length <= MAX_CONTEXT_DOC_LENGTH) return collapsed;
+  return `${collapsed.slice(0, MAX_CONTEXT_DOC_LENGTH - 1).trimEnd()}...`;
 }
 
 function renderCustomSectionPreview(entries: unknown[]): string {
