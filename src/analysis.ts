@@ -1,5 +1,6 @@
 import type {
   AnalysisResult,
+  ContractCustomSections,
   ContractMetadata,
   Env,
   FailedTransaction,
@@ -40,60 +41,169 @@ Rules:
 - If evidence is weak or ambiguous, say so in "detailedAnalysis" and lower confidence instead of overfitting.
 - Keep "summary", "likelyCause", and "suggestedFix" concise, but make "detailedAnalysis" and "debugSteps" genuinely useful to a developer.`;
 
+interface AiCompactionProfile {
+  name: string;
+  includeRaw: boolean;
+  includeDecodedViews: boolean;
+  summarizeContractSections: boolean;
+  maxStringLength: number;
+  maxDepth: number;
+  shallowArrayLimit: number;
+  deepArrayLimit: number;
+}
+
+interface BuiltAnalysisPrompt {
+  content: string;
+  profileName: string;
+  toonChars: number;
+}
+
+const ANALYSIS_PROMPT_CHAR_BUDGET = 450000;
+const TOON_TAB_DELIMITER = "\t";
+const CONTRACT_SECTION_PREVIEW_LIMIT = 1200;
+const ANALYSIS_PROMPT_PROFILES: AiCompactionProfile[] = [
+  {
+    name: "full",
+    includeRaw: true,
+    includeDecodedViews: true,
+    summarizeContractSections: false,
+    maxStringLength: 50000,
+    maxDepth: 14,
+    shallowArrayLimit: 200,
+    deepArrayLimit: 120,
+  },
+  {
+    name: "contract_section_summaries",
+    includeRaw: true,
+    includeDecodedViews: true,
+    summarizeContractSections: true,
+    maxStringLength: 50000,
+    maxDepth: 14,
+    shallowArrayLimit: 200,
+    deepArrayLimit: 120,
+  },
+  {
+    name: "no_raw_mirrors",
+    includeRaw: false,
+    includeDecodedViews: true,
+    summarizeContractSections: true,
+    maxStringLength: 40000,
+    maxDepth: 12,
+    shallowArrayLimit: 160,
+    deepArrayLimit: 100,
+  },
+  {
+    name: "no_duplicate_views",
+    includeRaw: false,
+    includeDecodedViews: false,
+    summarizeContractSections: true,
+    maxStringLength: 40000,
+    maxDepth: 12,
+    shallowArrayLimit: 160,
+    deepArrayLimit: 100,
+  },
+  {
+    name: "compact",
+    includeRaw: false,
+    includeDecodedViews: false,
+    summarizeContractSections: true,
+    maxStringLength: 20000,
+    maxDepth: 10,
+    shallowArrayLimit: 120,
+    deepArrayLimit: 60,
+  },
+  {
+    name: "tight",
+    includeRaw: false,
+    includeDecodedViews: false,
+    summarizeContractSections: true,
+    maxStringLength: 10000,
+    maxDepth: 8,
+    shallowArrayLimit: 80,
+    deepArrayLimit: 40,
+  },
+];
+
 function buildUserPrompt(
   tx: FailedTransaction,
   contracts?: Map<string, ContractMetadata>,
-): string {
-  const aiPayload = compactForAi({
-    transaction: {
-      txHash: tx.txHash,
-      observationKind: tx.observationKind,
-      ledgerSequence: tx.ledgerSequence,
-      ledgerCloseTime: tx.ledgerCloseTime,
-      resultKind: tx.resultKind,
-      operationTypes: tx.operationTypes,
-      sorobanOperationTypes: tx.sorobanOperationTypes,
-      contractIds: tx.contractIds,
-      topLevelFunction: tx.decoded.topLevelFunction,
-      readout: tx.readout,
-    },
-    evidence: {
-      errorSignatures: tx.decoded.errorSignatures,
-      invokeCalls: tx.decoded.invokeCalls,
-      authEntries: tx.decoded.authEntries,
-      resourceLimits: tx.decoded.resourceLimits,
-      transactionResult: tx.decoded.transactionResult,
-      diagnosticEvents: tx.decoded.diagnosticEvents,
-      contractEvents: tx.decoded.contractEvents,
-      sorobanMeta: tx.decoded.sorobanMeta,
-      operationEffects: tx.decoded.processingOperations,
-      ledgerChanges: tx.decoded.ledgerChanges,
-      touchedContractIds: tx.decoded.touchedContractIds,
-    },
-    raw: {
-      envelope: tx.envelopeJson,
-      processing: tx.processingJson,
-    },
-    decoded: {
-      envelope: tx.decoded.decodedEnvelope ?? null,
-      processing: tx.decoded.decodedProcessing ?? null,
-    },
-    contracts: summarizeContracts(contracts),
-  });
+): BuiltAnalysisPrompt {
+  let lastAttempt: BuiltAnalysisPrompt | null = null;
 
-  const toon = encodeToon(aiPayload, { keyFolding: "safe" });
+  for (const profile of ANALYSIS_PROMPT_PROFILES) {
+    const aiPayload = compactForAi({
+      transaction: {
+        txHash: tx.txHash,
+        observationKind: tx.observationKind,
+        ledgerSequence: tx.ledgerSequence,
+        ledgerCloseTime: tx.ledgerCloseTime,
+        resultKind: tx.resultKind,
+        operationTypes: tx.operationTypes,
+        sorobanOperationTypes: tx.sorobanOperationTypes,
+        contractIds: tx.contractIds,
+        topLevelFunction: tx.decoded.topLevelFunction,
+        readout: tx.readout,
+      },
+      evidence: {
+        errorSignatures: tx.decoded.errorSignatures,
+        invokeCalls: tx.decoded.invokeCalls,
+        authEntries: tx.decoded.authEntries,
+        resourceLimits: tx.decoded.resourceLimits,
+        transactionResult: tx.decoded.transactionResult,
+        diagnosticEvents: tx.decoded.diagnosticEvents,
+        contractEvents: tx.decoded.contractEvents,
+        sorobanMeta: tx.decoded.sorobanMeta,
+        operationEffects: tx.decoded.processingOperations,
+        ledgerChanges: tx.decoded.ledgerChanges,
+        touchedContractIds: tx.decoded.touchedContractIds,
+      },
+      raw: profile.includeRaw
+        ? {
+          envelope: tx.envelopeJson,
+          processing: tx.processingJson,
+        }
+        : undefined,
+      decoded: profile.includeDecodedViews
+        ? {
+          envelope: tx.decoded.decodedEnvelope ?? null,
+          processing: tx.decoded.decodedProcessing ?? null,
+        }
+        : undefined,
+      contracts: summarizeContracts(contracts, profile),
+    }, profile);
 
-  return [
-    "The following document is TOON, a lossless structured encoding of JSON optimized for LLM input.",
-    "Interpret it as structured data. Arrays may use [N] lengths and uniform object arrays may use {field,...} headers.",
-    "```toon",
-    toon,
-    "```",
-  ].join("\n\n");
+    const toon = encodeToon(aiPayload, {
+      keyFolding: "safe",
+      delimiter: TOON_TAB_DELIMITER,
+    });
+    const content = [
+      "The following document is TOON, a lossless structured encoding of JSON optimized for LLM input.",
+      "Interpret it as structured data. Arrays may use [N] lengths, uniform object arrays may use {field,...} headers, and tabular rows may be tab-separated.",
+      "```toon",
+      toon,
+      "```",
+    ].join("\n\n");
+
+    lastAttempt = {
+      content,
+      profileName: profile.name,
+      toonChars: toon.length,
+    };
+    if (toon.length <= ANALYSIS_PROMPT_CHAR_BUDGET) {
+      return lastAttempt;
+    }
+  }
+
+  return lastAttempt ?? {
+    content: "",
+    profileName: "empty",
+    toonChars: 0,
+  };
 }
 
 function summarizeContracts(
-  contracts?: Map<string, ContractMetadata>,
+  contracts: Map<string, ContractMetadata> | undefined,
+  profile: AiCompactionProfile,
 ): unknown[] {
   if (!contracts || contracts.size === 0) return [];
 
@@ -103,28 +213,58 @@ function summarizeContracts(
     functions: meta.functions,
     errorEnums: meta.errorEnums,
     structs: meta.structs,
-    customSections: meta.customSections,
+    customSections: profile.summarizeContractSections
+      ? summarizeContractSections(meta.customSections)
+      : meta.customSections,
   }));
 }
 
-function compactForAi(value: unknown, depth = 0): unknown {
+function summarizeContractSections(
+  customSections?: ContractCustomSections,
+): Record<string, unknown> | null {
+  if (!customSections) return null;
+
+  return {
+    contractspecv0Entries: customSections.contractspecv0?.length ?? 0,
+    contractmetav0Entries: customSections.contractmetav0?.length ?? 0,
+    contractenvmetav0Entries: customSections.contractenvmetav0?.length ?? 0,
+    contractmetav0Preview: previewSection(customSections.contractmetav0),
+    contractenvmetav0Preview: previewSection(customSections.contractenvmetav0),
+  };
+}
+
+function previewSection(entries?: unknown[]): string | null {
+  if (!entries || entries.length === 0) return null;
+
+  const preview = JSON.stringify(entries.slice(0, 2));
+  return preview.length > CONTRACT_SECTION_PREVIEW_LIMIT
+    ? `${preview.slice(0, CONTRACT_SECTION_PREVIEW_LIMIT)}... [truncated]`
+    : preview;
+}
+
+function compactForAi(
+  value: unknown,
+  profile: AiCompactionProfile,
+  depth = 0,
+): unknown {
   if (value === null || value === undefined) return value ?? null;
   if (typeof value === "string") {
-    return value.length > 10000
-      ? `${value.slice(0, 10000)}... [truncated]`
+    return value.length > profile.maxStringLength
+      ? `${value.slice(0, profile.maxStringLength)}... [truncated]`
       : value;
   }
   if (typeof value !== "object") return value;
-  if (depth >= 7) return "[max-depth]";
+  if (depth >= profile.maxDepth) return "[max-depth]";
 
   if (Array.isArray(value)) {
-    const limit = depth <= 1 ? 50 : 30;
+    const limit = depth <= 1 ? profile.shallowArrayLimit : profile.deepArrayLimit;
     const items = value
       .slice(0, limit)
-      .map((item) => compactForAi(item, depth + 1));
+      .map((item) => compactForAi(item, profile, depth + 1));
     if (value.length > limit) {
       items.push({
         _truncated: true,
+        keptItems: limit,
         remainingItems: value.length - limit,
       });
     }
@@ -133,7 +273,8 @@ function compactForAi(value: unknown, depth = 0): unknown {
 
   const output: Record<string, unknown> = {};
   for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
-    output[key] = compactForAi(inner, depth + 1);
+    if (inner === undefined) continue;
+    output[key] = compactForAi(inner, profile, depth + 1);
   }
   return output;
 }
@@ -160,6 +301,7 @@ function normalizeStringArray(
 }
 
 const FALLBACK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const MAX_COMPLETION_TOKENS = 8192;
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [2000, 5000]; // ms
 
@@ -176,7 +318,7 @@ async function runAIWithRetry(
         const response: any = await env.AI.run(model as any, {
           messages,
           temperature: 0.3,
-          max_completion_tokens: 4096,
+          max_completion_tokens: MAX_COMPLETION_TOKENS,
         });
 
         let text: string | null = null;
@@ -184,8 +326,13 @@ async function runAIWithRetry(
           text = response;
         } else if (response?.response) {
           text = response.response;
-        } else if (response?.choices?.[0]?.message?.content) {
+        } else if (typeof response?.choices?.[0]?.message?.content === "string") {
           text = response.choices[0].message.content;
+        } else if (Array.isArray(response?.choices?.[0]?.message?.content)) {
+          text = response.choices[0].message.content
+            .map((part: any) => (typeof part?.text === "string" ? part.text : ""))
+            .join("")
+            .trim() || null;
         }
 
         if (!text) {
@@ -241,9 +388,20 @@ export async function analyzeFailedTransaction(
   const modelId = env.AI_ANALYSIS_MODEL;
 
   try {
+    const prompt = buildUserPrompt(tx, contracts);
+    if (prompt.profileName !== ANALYSIS_PROMPT_PROFILES[0].name) {
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "analysis.prompt_compacted",
+        txHash: tx.txHash,
+        profile: prompt.profileName,
+        toonChars: prompt.toonChars,
+      }));
+    }
+
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildUserPrompt(tx, contracts) },
+      { role: "user", content: prompt.content },
     ];
 
     const { text, usedModel } = await runAIWithRetry(env, messages, modelId);
