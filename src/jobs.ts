@@ -14,9 +14,9 @@ import {
   bumpErrorEntry,
   findErrorEntryByTxHash,
   getErrorEntry,
-  getExampleTransaction,
 } from "./storage.js";
 import type { Env, ErrorEntry, ExampleTransactionRecord } from "./types.js";
+import { ensureExampleTransaction } from "./reference-transactions.js";
 
 type WorkflowStatusValue =
   | "queued"
@@ -172,7 +172,7 @@ export async function preflightDirectErrorSubmission(
       fingerprint: exactByTxHash.fingerprint,
       entry: exactByTxHash,
       example: sanitizeExampleTransaction(
-        await getExampleTransaction(env, exactByTxHash.fingerprint),
+        await ensureExampleTransaction(env, exactByTxHash.fingerprint),
       ),
     };
   }
@@ -220,7 +220,7 @@ async function applyFingerprintDuplicateCheck(
       lastSeen: transaction.ledgerCloseTime,
     },
     example: sanitizeExampleTransaction(
-      await getExampleTransaction(env, fingerprint),
+      await ensureExampleTransaction(env, fingerprint, transaction),
     ),
   };
 }

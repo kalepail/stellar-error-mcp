@@ -7,8 +7,9 @@ import {
 } from "../src/storage.js";
 import type { AsyncJob } from "../src/types.js";
 
-const { preflightDirectErrorSubmission } = vi.hoisted(() => ({
+const { preflightDirectErrorSubmission, syncJobWithWorkflowStatus } = vi.hoisted(() => ({
   preflightDirectErrorSubmission: vi.fn(),
+  syncJobWithWorkflowStatus: vi.fn(async (_env: unknown, job: unknown) => job),
 }));
 
 vi.mock("../src/mcp.js", () => ({
@@ -22,7 +23,7 @@ vi.mock("../src/direct.js", () => ({
 vi.mock("../src/workflows.js", () => ({
   DirectErrorWorkflow: class {},
   LedgerRangeWorkflow: class {},
-  syncJobWithWorkflowStatus: async (_env: unknown, job: unknown) => job,
+  syncJobWithWorkflowStatus,
 }));
 
 vi.mock("../src/jobs.js", async () => {
@@ -82,6 +83,8 @@ vi.mock("../src/jobs.js", async () => {
 describe("worker fetch routes", () => {
   beforeEach(() => {
     preflightDirectErrorSubmission.mockReset();
+    syncJobWithWorkflowStatus.mockReset();
+    syncJobWithWorkflowStatus.mockImplementation(async (_env: unknown, job: unknown) => job);
   });
 
   it("serves a health document aligned with the workflow architecture", async () => {
@@ -95,12 +98,7 @@ describe("worker fetch routes", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       service: "stellar-error-mcp",
-      endpoints: {
-        trigger: "/trigger",
-        batch: "/batch",
-        forwardError: "/forward-error",
-        jobStatus: "/jobs/:jobId",
-      },
+      status: "ok",
     });
   });
 
@@ -255,6 +253,37 @@ describe("worker fetch routes", () => {
     expect(json).not.toHaveProperty("submission");
   });
 
+  it("falls back to the stored job snapshot when workflow status sync throws", async () => {
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "lb_syncfallback",
+      kind: "ledger_batch",
+      status: "queued",
+      phase: "accepted",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:01:00.000Z",
+      progress: { completed: 0, unit: "ledgers" },
+      workflowStatus: "queued",
+    };
+    await storeAsyncJob(env, job);
+    syncJobWithWorkflowStatus.mockRejectedValueOnce(new Error("workflow backend unavailable"));
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("https://example.com/jobs/lb_syncfallback"),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      jobId: "lb_syncfallback",
+      status: "queued",
+      phase: "accepted",
+      workflowStatus: "queued",
+    });
+  });
+
   it("does not synthesize a public job when the snapshot is missing", async () => {
     const env = createTestEnv();
     env.DIRECT_ERROR_WORKFLOW.setStatus("de_orphaned", { status: "running" });
@@ -318,5 +347,45 @@ describe("worker fetch routes", () => {
       status: "accepted",
     });
     expect(env.LEDGER_RANGE_WORKFLOW.created).toHaveLength(1);
+  });
+
+  it("terminates a running recurring scan job via the management endpoint", async () => {
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "rs_terminate",
+      kind: "recurring_scan",
+      status: "running",
+      phase: "scanning",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:01:00.000Z",
+      progress: { completed: 10, total: 200, unit: "ledgers" },
+      workflowStatus: "running",
+    };
+    await storeAsyncJob(env, job);
+    await setActiveRecurringScanRecord(env, {
+      jobId: job.jobId,
+      updatedAt: job.updatedAt,
+    });
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("https://example.com/admin/jobs/rs_terminate/terminate", {
+        method: "POST",
+        headers: { authorization: "Bearer test-token" },
+      }),
+      { ...env, MANAGEMENT_TOKEN: "test-token" },
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      status: "ok",
+      job: {
+        jobId: "rs_terminate",
+        workflowStatus: "terminated",
+        status: "failed",
+      },
+    });
+    await expect(env.CURSOR_KV.get("active_recurring_scan_job")).resolves.toBeNull();
   });
 });

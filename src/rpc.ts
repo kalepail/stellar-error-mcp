@@ -3,7 +3,8 @@ import type { Env } from "./types.js";
 type RpcMethod =
   | "getLatestLedger"
   | "getLedgerEntries"
-  | "getLedgers";
+  | "getLedgers"
+  | "getTransaction";
 
 interface RpcRequestOptions {
   endpoint: string;

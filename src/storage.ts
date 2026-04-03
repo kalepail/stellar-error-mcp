@@ -10,22 +10,42 @@ import type {
   FailedTransaction,
   ObservationKind,
 } from "./types.js";
-import { buildSearchDocument } from "./ai-search.js";
+import { buildSearchDocument, SEARCH_DOCS_PREFIX } from "./ai-search.js";
 
 const CURSOR_KEY = "last_processed_ledger";
 const ACTIVE_RECURRING_SCAN_KEY = "active_recurring_scan_job";
 const ACTIVE_DIRECT_JOB_PREFIX = "active_direct_job:";
-const LEGACY_TX_INDEX_PREFIX = "tx:";
+const TX_FINGERPRINT_KV_PREFIX = "tx:";
 const EMBEDDING_MODEL = "@cf/baai/bge-base-en-v1.5";
 const SIMILARITY_THRESHOLD = 0.90;
 const MAX_TX_HASHES_PER_ENTRY = 50;
+const REFERENCE_TRANSACTIONS_PREFIX = "reference-transactions/";
 const JOBS_PREFIX = "jobs/";
 const JOB_INPUTS_PREFIX = "job-inputs/";
 const JOB_RESULTS_PREFIX = "job-results/";
 const JOB_STAGING_PREFIX = "job-staging/";
 
-function txIndexObjectKey(txHash: string): string {
-  return `tx-index/${txHash}.json`;
+function getWorkflowArtifactsBucket(env: Env): R2Bucket {
+  return env.WORKFLOW_ARTIFACTS_BUCKET ?? env.ERRORS_BUCKET;
+}
+
+async function deleteBucketPrefix(
+  bucket: R2Bucket,
+  prefix: string,
+): Promise<number> {
+  let deleted = 0;
+
+  while (true) {
+    const listed = await bucket.list({ prefix, limit: 1000 });
+    const keys = listed.objects.map((object) => object.key);
+    if (keys.length > 0) {
+      await bucket.delete(keys);
+      deleted += keys.length;
+    }
+    if (!listed.truncated) break;
+  }
+
+  return deleted;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -34,6 +54,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalizeString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function normalizeTimestampString(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const millis = value < 1_000_000_000_000 ? value * 1000 : value;
+    return new Date(millis).toISOString();
+  }
+
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+
+  if (/^\d+$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      const millis = trimmed.length <= 10 ? numeric * 1000 : numeric;
+      return new Date(millis).toISOString();
+    }
+  }
+
+  const parsed = new Date(trimmed);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString();
+  }
+
+  return trimmed;
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -72,6 +121,10 @@ function normalizeObservationKinds(value: unknown): ObservationKind[] {
     .filter((item, index, all) => all.indexOf(item) === index);
 
   return normalized.length > 0 ? normalized : ["ledger_scan"];
+}
+
+function isTerminalAsyncJobStatus(status: AsyncJob["status"]): boolean {
+  return status === "completed" || status === "failed";
 }
 
 function normalizeErrorReadout(
@@ -154,8 +207,8 @@ export function normalizeErrorEntry(
   const seenCount = typeof raw.seenCount === "number" && Number.isFinite(raw.seenCount)
     ? raw.seenCount
     : null;
-  const firstSeen = normalizeString(raw.firstSeen);
-  const lastSeen = normalizeString(raw.lastSeen);
+  const firstSeen = normalizeTimestampString(raw.firstSeen);
+  const lastSeen = normalizeTimestampString(raw.lastSeen);
   const likelyCause = normalizeString(raw.likelyCause);
   const suggestedFix = normalizeString(raw.suggestedFix);
   const detailedAnalysis = normalizeString(raw.detailedAnalysis);
@@ -325,42 +378,14 @@ export async function storeTxHashPointer(
   txHash: string,
   fingerprint: string,
 ): Promise<void> {
-  await env.ERRORS_BUCKET.put(
-    txIndexObjectKey(txHash),
-    JSON.stringify({ fingerprint }, null, 2),
-    {
-      httpMetadata: { contentType: "application/json" },
-      customMetadata: { txHash, fingerprint },
-    },
-  );
-  await env.CURSOR_KV.put(`${LEGACY_TX_INDEX_PREFIX}${txHash}`, fingerprint);
+  await env.CURSOR_KV.put(`${TX_FINGERPRINT_KV_PREFIX}${txHash}`, fingerprint);
 }
 
 export async function getFingerprintByTxHash(
   env: Env,
   txHash: string,
 ): Promise<string | null> {
-  const object = await env.ERRORS_BUCKET.get(txIndexObjectKey(txHash));
-  if (object) {
-    const raw = await object.json();
-    if (isRecord(raw) && typeof raw.fingerprint === "string" && raw.fingerprint.length > 0) {
-      return raw.fingerprint;
-    }
-  }
-
-  const legacy = await env.CURSOR_KV.get(`${LEGACY_TX_INDEX_PREFIX}${txHash}`);
-  if (!legacy) return null;
-
-  // Backfill the new R2 index lazily so older deployments keep exact-dedupe behavior.
-  await env.ERRORS_BUCKET.put(
-    txIndexObjectKey(txHash),
-    JSON.stringify({ fingerprint: legacy }, null, 2),
-    {
-      httpMetadata: { contentType: "application/json" },
-      customMetadata: { txHash, fingerprint: legacy },
-    },
-  );
-  return legacy;
+  return env.CURSOR_KV.get(`${TX_FINGERPRINT_KV_PREFIX}${txHash}`);
 }
 
 export async function findErrorEntryByTxHash(
@@ -380,7 +405,7 @@ export async function storeExampleTransaction(
   fingerprint: string,
   contracts: ContractMetadata[] = [],
 ): Promise<void> {
-  const key = `examples/${fingerprint}.json`;
+  const key = `${REFERENCE_TRANSACTIONS_PREFIX}${fingerprint}.json`;
   const record: ExampleTransactionRecord = {
     fingerprint,
     storedAt: new Date().toISOString(),
@@ -403,9 +428,26 @@ export async function getExampleTransaction(
   env: Env,
   fingerprint: string,
 ): Promise<ExampleTransactionRecord | null> {
-  const object = await env.ERRORS_BUCKET.get(`examples/${fingerprint}.json`);
+  const object = await env.ERRORS_BUCKET.get(
+    `${REFERENCE_TRANSACTIONS_PREFIX}${fingerprint}.json`,
+  );
   if (!object) return null;
   return object.json();
+}
+
+export async function deleteExampleTransaction(
+  env: Env,
+  fingerprint: string,
+): Promise<void> {
+  await env.ERRORS_BUCKET.delete(`${REFERENCE_TRANSACTIONS_PREFIX}${fingerprint}.json`);
+}
+
+export async function deleteErrorEntryArtifacts(
+  env: Env,
+  fingerprint: string,
+): Promise<void> {
+  await env.ERRORS_BUCKET.delete(`errors/${fingerprint}.json`);
+  await env.ERRORS_BUCKET.delete(`${SEARCH_DOCS_PREFIX}${fingerprint}.md`);
 }
 
 // --- Vector similarity (Vectorize-based semantic dedup) ---
@@ -495,7 +537,7 @@ export async function storeAsyncJob(
   env: Env,
   job: AsyncJob,
 ): Promise<void> {
-  await env.ERRORS_BUCKET.put(
+  await getWorkflowArtifactsBucket(env).put(
     `${JOBS_PREFIX}${job.jobId}.json`,
     JSON.stringify(job, null, 2),
     {
@@ -518,7 +560,7 @@ export async function getAsyncJob(
   env: Env,
   jobId: string,
 ): Promise<AsyncJob | null> {
-  const object = await env.ERRORS_BUCKET.get(`${JOBS_PREFIX}${jobId}.json`);
+  const object = await getWorkflowArtifactsBucket(env).get(`${JOBS_PREFIX}${jobId}.json`);
   if (!object) return null;
   return await object.json() as AsyncJob;
 }
@@ -528,7 +570,7 @@ export async function storeJobInput(
   jobId: string,
   input: AsyncJobInput,
 ): Promise<void> {
-  await env.ERRORS_BUCKET.put(
+  await getWorkflowArtifactsBucket(env).put(
     `${JOB_INPUTS_PREFIX}${jobId}.json`,
     JSON.stringify(input, null, 2),
     { httpMetadata: { contentType: "application/json" } },
@@ -539,7 +581,7 @@ export async function getJobInput(
   env: Env,
   jobId: string,
 ): Promise<AsyncJobInput | null> {
-  const object = await env.ERRORS_BUCKET.get(`${JOB_INPUTS_PREFIX}${jobId}.json`);
+  const object = await getWorkflowArtifactsBucket(env).get(`${JOB_INPUTS_PREFIX}${jobId}.json`);
   if (!object) return null;
   return await object.json() as AsyncJobInput;
 }
@@ -550,7 +592,7 @@ export async function storeJobResultArtifact(
   payload: unknown,
 ): Promise<string> {
   const key = `${JOB_RESULTS_PREFIX}${jobId}.json`;
-  await env.ERRORS_BUCKET.put(key, JSON.stringify(payload, null, 2), {
+  await getWorkflowArtifactsBucket(env).put(key, JSON.stringify(payload, null, 2), {
     httpMetadata: { contentType: "application/json" },
   });
   return key;
@@ -564,7 +606,7 @@ export async function storeStagedFailedTransaction(
 ): Promise<string> {
   const safeHash = txHash.replace(/[^a-zA-Z0-9_-]/g, "_");
   const key = `${JOB_STAGING_PREFIX}${jobId}/transactions/${safeHash}.json`;
-  await env.ERRORS_BUCKET.put(key, JSON.stringify(transaction, null, 2), {
+  await getWorkflowArtifactsBucket(env).put(key, JSON.stringify(transaction, null, 2), {
     httpMetadata: { contentType: "application/json" },
   });
   return key;
@@ -574,9 +616,35 @@ export async function getStagedFailedTransaction(
   env: Env,
   key: string,
 ): Promise<FailedTransaction | null> {
-  const object = await env.ERRORS_BUCKET.get(key);
+  const object = await getWorkflowArtifactsBucket(env).get(key);
   if (!object) return null;
   return await object.json() as FailedTransaction;
+}
+
+export async function findStagedFailedTransactionByTxHash(
+  env: Env,
+  txHash: string,
+): Promise<FailedTransaction | null> {
+  const safeHash = txHash.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const suffix = `/transactions/${safeHash}.json`;
+  const bucket = getWorkflowArtifactsBucket(env);
+  let cursor: string | undefined;
+
+  while (true) {
+    const listed = await bucket.list({
+      prefix: JOB_STAGING_PREFIX,
+      cursor,
+      limit: 1000,
+    });
+    const match = listed.objects.find((object) => object.key.endsWith(suffix));
+    if (match) {
+      return getStagedFailedTransaction(env, match.key);
+    }
+    if (!listed.truncated) {
+      return null;
+    }
+    cursor = listed.cursor;
+  }
 }
 
 export async function storeJobStepResult(
@@ -585,7 +653,7 @@ export async function storeJobStepResult(
   stepName: string,
   result: unknown,
 ): Promise<void> {
-  await env.ERRORS_BUCKET.put(
+  await getWorkflowArtifactsBucket(env).put(
     `${JOB_STAGING_PREFIX}${jobId}/step-results/${stepName}.json`,
     JSON.stringify(result, null, 2),
     { httpMetadata: { contentType: "application/json" } },
@@ -597,11 +665,52 @@ export async function getJobStepResult<T>(
   jobId: string,
   stepName: string,
 ): Promise<T | null> {
-  const object = await env.ERRORS_BUCKET.get(
+  const object = await getWorkflowArtifactsBucket(env).get(
     `${JOB_STAGING_PREFIX}${jobId}/step-results/${stepName}.json`,
   );
   if (!object) return null;
   return await object.json() as T;
+}
+
+export async function cleanupTransientArtifactsForJob(
+  env: Env,
+  jobId: string,
+): Promise<void> {
+  const bucket = getWorkflowArtifactsBucket(env);
+  await bucket.delete(`${JOB_INPUTS_PREFIX}${jobId}.json`);
+  await deleteBucketPrefix(bucket, `${JOB_STAGING_PREFIX}${jobId}/`);
+}
+
+export async function cleanupRetainedJobArtifacts(
+  env: Env,
+  retentionHours = Number(env.JOB_RETENTION_HOURS ?? "72"),
+): Promise<{ deletedJobs: number; deletedArtifacts: number }> {
+  const bucket = getWorkflowArtifactsBucket(env);
+  const cutoff = Date.now() - Math.max(retentionHours, 1) * 60 * 60 * 1000;
+  const listed = await bucket.list({ prefix: JOBS_PREFIX, limit: 1000 });
+
+  let deletedJobs = 0;
+  let deletedArtifacts = 0;
+
+  for (const object of listed.objects) {
+    if (object.uploaded.getTime() > cutoff) continue;
+    const body = await bucket.get(object.key);
+    if (!body) continue;
+
+    const job = await body.json() as AsyncJob;
+    if (!isTerminalAsyncJobStatus(job.status)) continue;
+
+    await bucket.delete(object.key);
+    deletedJobs += 1;
+
+    await bucket.delete(`${JOB_RESULTS_PREFIX}${job.jobId}.json`);
+    deletedArtifacts += 1;
+    await bucket.delete(`${JOB_INPUTS_PREFIX}${job.jobId}.json`);
+    deletedArtifacts += 1;
+    deletedArtifacts += await deleteBucketPrefix(bucket, `${JOB_STAGING_PREFIX}${job.jobId}/`);
+  }
+
+  return { deletedJobs, deletedArtifacts };
 }
 
 export async function setActiveRecurringScanRecord(

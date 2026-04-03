@@ -218,6 +218,12 @@ describe("workflow classes", () => {
       status: "completed",
       phase: "completed",
     });
+    expect(env.WORKFLOW_ARTIFACTS_BUCKET.getJson("job-inputs/de_staged.json")).toBeNull();
+    expect(
+      [...env.WORKFLOW_ARTIFACTS_BUCKET.objects.keys()].some((key) =>
+        key.startsWith("job-staging/de_staged/"),
+      ),
+    ).toBe(false);
   });
 
   it("stages chunk transactions and uses deterministic step names", async () => {
@@ -274,10 +280,15 @@ describe("workflow classes", () => {
     expect(recorder.names).toContain("scan-chunk-10-20");
     expect(recorder.names).toContain("ingest-tx-tx_hash_1");
     expect(
-      [...env.ERRORS_BUCKET.objects.keys()].some((key) =>
-        key.startsWith("job-staging/lb_chunks/transactions/"),
+      [...env.WORKFLOW_ARTIFACTS_BUCKET.objects.keys()].some((key) =>
+        key === "job-results/lb_chunks.json",
       ),
     ).toBe(true);
+    expect(
+      [...env.WORKFLOW_ARTIFACTS_BUCKET.objects.keys()].some((key) =>
+        key.startsWith("job-staging/lb_chunks/transactions/"),
+      ),
+    ).toBe(false);
   });
 
   it("ingests each staged transaction even when hashes differ only after a shared prefix", async () => {

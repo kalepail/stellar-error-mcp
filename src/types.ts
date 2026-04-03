@@ -1,5 +1,6 @@
 export interface Env {
   ERRORS_BUCKET: R2Bucket;
+  WORKFLOW_ARTIFACTS_BUCKET?: R2Bucket;
   CURSOR_KV: KVNamespace;
   VECTORIZE: VectorizeIndex;
   AI: Ai;
@@ -14,6 +15,7 @@ export interface Env {
   AI_SEARCH_INSTANCE: string;
   AI_SEARCH_MODEL: string;
   AI_ANALYSIS_MODEL: string;
+  JOB_RETENTION_HOURS?: string;
 }
 
 export interface ErrorSignature {

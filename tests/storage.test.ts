@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   bumpErrorEntry,
+  cleanupRetainedJobArtifacts,
+  getExampleTransaction,
   findErrorEntryByTxHash,
   getErrorEntry,
   normalizeErrorEntry,
@@ -106,7 +108,7 @@ describe("storage", () => {
     expect(await searchDoc?.text()).toContain("Last seen: 2026-04-02T00:00:00.000Z");
   });
 
-  it("writes tx hash pointers to the new R2 index and the legacy KV index", async () => {
+  it("writes tx hash pointers to KV for direct tx-hash lookup", async () => {
     const bucket = new MemoryR2Bucket();
     const env = createTestEnv(bucket);
 
@@ -121,18 +123,6 @@ describe("storage", () => {
     expect(bucket.listCalls).toHaveLength(0);
   });
 
-  it("falls back to the legacy KV tx index and backfills the R2 pointer", async () => {
-    const bucket = new MemoryR2Bucket();
-    const env = createTestEnv(bucket);
-
-    await storeErrorEntry(env, baseEntry);
-    await env.CURSOR_KV.put("tx:tx-old", "fp-1");
-
-    const found = await findErrorEntryByTxHash(env, "tx-old");
-    expect(found?.fingerprint).toBe("fp-1");
-    expect(bucket.getJson("tx-index/tx-old.json")).toEqual({ fingerprint: "fp-1" });
-  });
-
   it("rejects malformed current-shape entries instead of repairing them", () => {
     expect(
       normalizeErrorEntry({
@@ -140,5 +130,48 @@ describe("storage", () => {
         summary: "Broken entry",
       }),
     ).toBeNull();
+  });
+
+  it("reads reference transactions from the durable prefix", async () => {
+    const bucket = new MemoryR2Bucket();
+    const env = createTestEnv(bucket);
+
+    await bucket.put(
+      "reference-transactions/fp-new.json",
+      JSON.stringify({ fingerprint: "fp-new", transaction: { txHash: "tx-new" }, contracts: [], storedAt: "now" }),
+    );
+
+    await expect(getExampleTransaction(env, "fp-new")).resolves.toMatchObject({
+      fingerprint: "fp-new",
+    });
+    await expect(getExampleTransaction(env, "fp-old")).resolves.toBeNull();
+  });
+
+  it("removes retained terminal job artifacts from the workflow bucket", async () => {
+    const env = createTestEnv();
+
+    await env.WORKFLOW_ARTIFACTS_BUCKET.put(
+      "jobs/job-1.json",
+      JSON.stringify({
+        jobId: "job-1",
+        kind: "ledger_batch",
+        status: "completed",
+        phase: "completed",
+        createdAt: "2026-04-02T00:00:00.000Z",
+        updatedAt: "2026-04-02T00:00:00.000Z",
+        progress: { completed: 1, total: 1, unit: "steps" },
+      }),
+    );
+    await env.WORKFLOW_ARTIFACTS_BUCKET.put("job-results/job-1.json", JSON.stringify({ ok: true }));
+    await env.WORKFLOW_ARTIFACTS_BUCKET.put("job-inputs/job-1.json", JSON.stringify({ ok: true }));
+    await env.WORKFLOW_ARTIFACTS_BUCKET.put("job-staging/job-1/step-results/a.json", JSON.stringify({ ok: true }));
+
+    const summary = await cleanupRetainedJobArtifacts(env, 1);
+
+    expect(summary.deletedJobs).toBe(1);
+    expect(env.WORKFLOW_ARTIFACTS_BUCKET.getJson("jobs/job-1.json")).toBeNull();
+    expect(env.WORKFLOW_ARTIFACTS_BUCKET.getJson("job-results/job-1.json")).toBeNull();
+    expect(env.WORKFLOW_ARTIFACTS_BUCKET.getJson("job-inputs/job-1.json")).toBeNull();
+    expect(env.WORKFLOW_ARTIFACTS_BUCKET.getJson("job-staging/job-1/step-results/a.json")).toBeNull();
   });
 });

@@ -11,6 +11,10 @@
     {
       "binding": "ERRORS_BUCKET",
       "bucket_name": "stellar-errors"
+    },
+    {
+      "binding": "WORKFLOW_ARTIFACTS_BUCKET",
+      "bucket_name": "stellar-error-runtime"
     }
   ],
   "kv_namespaces": [
@@ -52,7 +56,8 @@
     "STELLAR_RPC_AUTH_MODE": "header",
     "AI_SEARCH_INSTANCE": "stellar-errors",
     "AI_SEARCH_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "AI_ANALYSIS_MODEL": "@cf/moonshotai/kimi-k2.5"
+    "AI_ANALYSIS_MODEL": "@cf/moonshotai/kimi-k2.5",
+    "JOB_RETENTION_HOURS": "72"
   },
   "observability": {
     "enabled": true,

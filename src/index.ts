@@ -1,6 +1,5 @@
 import type { AsyncJob, Env, LedgerRangeWorkflowInput } from "./types.js";
 import { createMcpFetchHandler } from "./mcp.js";
-import { SEARCH_DOCS_PREFIX } from "./ai-search.js";
 import { parsePositiveInteger } from "./input.js";
 import { parseDirectErrorSubmission } from "./direct.js";
 import {
@@ -13,6 +12,7 @@ import {
   buildDirectWorkflowInput,
 } from "./jobs.js";
 import {
+  cleanupRetainedJobArtifacts,
   getActiveDirectJob,
   getActiveRecurringScanRecord,
   getAsyncJob,
@@ -120,6 +120,14 @@ function isJobPathname(pathname: string): boolean {
 
 function extractJobIdFromPathname(pathname: string): string {
   return pathname.slice("/jobs/".length).trim();
+}
+
+function isAdminTerminateJobPathname(pathname: string): boolean {
+  return /^\/admin\/jobs\/[^/]+\/terminate$/.test(pathname);
+}
+
+function extractAdminTerminateJobId(pathname: string): string {
+  return pathname.slice("/admin/jobs/".length, -"/terminate".length).trim();
 }
 
 async function parseJsonBody(request: Request): Promise<unknown> {
@@ -295,7 +303,17 @@ async function getJobStatus(env: Env, jobId: string): Promise<AsyncJob | null> {
     if (isTerminalJobStatus(existing.status) && existing.workflowStatus) {
       return existing;
     }
-    return syncJobWithWorkflowStatus(env, existing);
+    try {
+      return await syncJobWithWorkflowStatus(env, existing);
+    } catch (error) {
+      logError("job.sync_status_failed", {
+        jobId,
+        storedStatus: existing.status,
+        storedPhase: existing.phase,
+        error: formatError(error),
+      });
+      return existing;
+    }
   }
   return null;
 }
@@ -420,6 +438,46 @@ export default {
       }
     }
 
+    if (isAdminTerminateJobPathname(url.pathname) && request.method === "POST") {
+      const authError = requireManagementAccess(request, env);
+      if (authError) return authError;
+
+      const jobId = extractAdminTerminateJobId(url.pathname);
+      const job = await getAsyncJob(env, jobId);
+      if (!job) {
+        return Response.json(
+          { status: "error", message: `Job ${jobId} not found.` },
+          { status: 404 },
+        );
+      }
+
+      try {
+        const binding = job.kind === "direct_error"
+          ? env.DIRECT_ERROR_WORKFLOW
+          : env.LEDGER_RANGE_WORKFLOW;
+        const instance = await binding.get(jobId);
+        await instance.terminate();
+
+        const next = updateJob(job, {
+          status: "failed",
+          phase: "failed",
+          workflowStatus: "terminated",
+          error: "Terminated by management endpoint.",
+        });
+        await storeAsyncJob(env, next);
+
+        if (job.kind === "recurring_scan") {
+          await setActiveRecurringScanRecord(env, null);
+        }
+
+        return Response.json({ status: "ok", job: next });
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.job_terminate_failed", { jobId, error: message });
+        return Response.json({ status: "error", message }, { status: 500 });
+      }
+    }
+
     if (isJobPathname(url.pathname) && request.method === "GET") {
       const jobId = extractJobIdFromPathname(url.pathname);
       if (!jobId) {
@@ -451,18 +509,6 @@ export default {
         service: "stellar-error-mcp",
         status: "ok",
         lastProcessedLedger: lastLedger,
-        aiSearch: {
-          instance: env.AI_SEARCH_INSTANCE,
-          searchablePrefix: SEARCH_DOCS_PREFIX,
-        },
-        endpoints: {
-          mcp: "/mcp",
-          trigger: "/trigger",
-          batch: "/batch",
-          forwardError: "/forward-error",
-          jobStatus: "/jobs/:jobId",
-          health: "/health",
-        },
       });
     }
 
@@ -484,6 +530,21 @@ export default {
         })
         .catch((error) => {
           logError("scheduled.recurring_scan_failed", {
+            error: formatError(error),
+          });
+        }),
+    );
+    ctx.waitUntil(
+      cleanupRetainedJobArtifacts(env)
+        .then(({ deletedJobs, deletedArtifacts }) => {
+          if (deletedJobs === 0 && deletedArtifacts === 0) return;
+          logInfo("scheduled.workflow_artifact_cleanup", {
+            deletedJobs,
+            deletedArtifacts,
+          });
+        })
+        .catch((error) => {
+          logError("scheduled.workflow_artifact_cleanup_failed", {
             error: formatError(error),
           });
         }),

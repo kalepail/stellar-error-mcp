@@ -1,3 +1,4 @@
+import { xdr } from "@stellar/stellar-sdk";
 import type { Env, FailedTransaction, ErrorReadout, ScanResult } from "./types.js";
 import { buildDecodedTransactionContext } from "./transaction.js";
 import { buildRpcUrl, getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
@@ -9,6 +10,10 @@ const SOROBAN_OPERATION_KEYS = new Set([
 ]);
 
 const SUCCESS_KINDS = new Set(["tx_success", "tx_fee_bump_inner_success"]);
+
+function xdrToJson<T>(value: T): unknown {
+  return JSON.parse(JSON.stringify(value));
+}
 
 // --- RPC Client ---
 
@@ -336,6 +341,64 @@ function buildErrorReadout(
   return readout;
 }
 
+function buildFailedSorobanTransaction(
+  txEntry: any,
+  processing: any,
+  ledgerSequence: number | string,
+  ledgerCloseTime: string | number,
+): FailedTransaction | null {
+  const txHash = processing?.result?.transaction_hash;
+  const resultKind = getProcessingResultKind(processing?.result);
+  if (!resultKind || SUCCESS_KINDS.has(resultKind)) return null;
+  if (!isSorobanLedgerTransaction(txEntry, processing)) return null;
+  if (typeof txHash !== "string" || txHash.length === 0) return null;
+
+  const decoded = buildDecodedTransactionContext(txEntry, processing);
+  const operationTypes = collectOperationTypes(txEntry);
+  const sorobanOperationTypes = collectSorobanOperationTypes(txEntry);
+  const primaryContractIds = [
+    ...new Set(
+      decoded.invokeCalls
+        .map((call) =>
+          typeof call.contractId === "string" ? call.contractId : null
+        )
+        .filter((value): value is string => value !== null && value.length > 0),
+    ),
+  ];
+  const contractIds = [
+    ...new Set(
+      [...primaryContractIds, ...decoded.touchedContractIds]
+        .filter((value) => value.length > 0),
+    ),
+  ];
+
+  const readout = buildErrorReadout(
+    txEntry,
+    processing,
+    resultKind,
+    decoded.invokeCalls,
+    contractIds,
+  );
+
+  return {
+    observationKind: "ledger_scan",
+    txHash,
+    ledgerSequence: typeof ledgerSequence === "number" ? ledgerSequence : parseInt(ledgerSequence),
+    ledgerCloseTime: String(ledgerCloseTime),
+    resultKind,
+    soroban: true,
+    primaryContractIds,
+    contractIds,
+    operationTypes,
+    sorobanOperationTypes,
+    diagnosticEvents: decoded.diagnosticEvents,
+    envelopeJson: txEntry,
+    processingJson: processing,
+    decoded,
+    readout,
+  };
+}
+
 function extractFailedSorobanTransactions(
   ledgers: any[],
 ): FailedTransaction[] {
@@ -354,73 +417,131 @@ function extractFailedSorobanTransactions(
     const ledgerCloseTime = ledger.ledgerCloseTime;
 
     for (let i = 0; i < txCount; i++) {
-      const txEntry = txEntries[i];
-      const processing = txProcessing[i];
-
       try {
-        const txHash = processing?.result?.transaction_hash;
-        const resultKind = getProcessingResultKind(processing?.result);
-        if (!resultKind || SUCCESS_KINDS.has(resultKind)) continue;
-        if (!isSorobanLedgerTransaction(txEntry, processing)) continue;
-        if (typeof txHash !== "string" || txHash.length === 0) continue;
-
-        const decoded = buildDecodedTransactionContext(txEntry, processing);
-        const operationTypes = collectOperationTypes(txEntry);
-        const sorobanOperationTypes = collectSorobanOperationTypes(txEntry);
-        // Primary contracts: only from the envelope invoke calls (for fingerprinting)
-        const primaryContractIds = [
-          ...new Set(
-            decoded.invokeCalls
-              .map((call) =>
-                typeof call.contractId === "string" ? call.contractId : null,
-              )
-              .filter((value): value is string => value !== null && value.length > 0),
-          ),
-        ];
-
-        // All contracts: envelope + diag + auth + meta (for context/lookup)
-        const contractIds = [
-          ...new Set(
-            [
-              ...primaryContractIds,
-              ...decoded.touchedContractIds,
-            ].filter((value) => value.length > 0),
-          ),
-        ];
-
-        const readout = buildErrorReadout(
-          txEntry,
-          processing,
-          resultKind,
-          decoded.invokeCalls,
-          contractIds,
+        const built = buildFailedSorobanTransaction(
+          txEntries[i],
+          txProcessing[i],
+          ledgerSequence,
+          ledgerCloseTime,
         );
-
-        failed.push({
-          observationKind: "ledger_scan",
-          txHash,
-          ledgerSequence: typeof ledgerSequence === "number" ? ledgerSequence : parseInt(ledgerSequence),
-          ledgerCloseTime: String(ledgerCloseTime),
-          resultKind,
-          soroban: true,
-          primaryContractIds,
-          contractIds,
-          operationTypes,
-          sorobanOperationTypes,
-          diagnosticEvents: decoded.diagnosticEvents,
-          envelopeJson: txEntry,
-          processingJson: processing,
-          decoded,
-          readout,
-        });
+        if (built) {
+          failed.push(built);
+        }
       } catch {
-        // Skip malformed transactions
         continue;
       }
     }
   }
 
   return failed;
+}
+
+function parseDiagnosticEventsXdr(events: unknown): unknown[] {
+  if (!Array.isArray(events)) return [];
+  return events.flatMap((item) => {
+    if (typeof item !== "string" || !item.length) return [];
+    try {
+      return [xdrToJson(xdr.DiagnosticEvent.fromXDR(item, "base64"))];
+    } catch {
+      return [];
+    }
+  });
+}
+
+function normalizeTransactionMeta(meta: unknown, diagnosticEvents: unknown[]): unknown {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return {
+      v4: {
+        operations: [],
+        events: [],
+        diagnostic_events: diagnosticEvents,
+        soroban_meta: null,
+      },
+    };
+  }
+
+  const candidate = JSON.parse(JSON.stringify(meta)) as Record<string, unknown>;
+  if ("v4" in candidate && candidate.v4 && typeof candidate.v4 === "object") {
+    const v4 = candidate.v4 as Record<string, unknown>;
+    if (!Array.isArray(v4.diagnostic_events)) {
+      v4.diagnostic_events = diagnosticEvents;
+    }
+    if (!Array.isArray(v4.events)) {
+      v4.events = [];
+    }
+    if (!Array.isArray(v4.operations)) {
+      v4.operations = [];
+    }
+    if (!("soroban_meta" in v4)) {
+      v4.soroban_meta = null;
+    }
+    return candidate;
+  }
+
+  return {
+    v4: {
+      operations: [],
+      events: [],
+      diagnostic_events: diagnosticEvents,
+      soroban_meta: null,
+    },
+  };
+}
+
+export async function getFailedTransactionByHash(
+  env: Env,
+  txHash: string,
+): Promise<FailedTransaction | null> {
+  const result = await rpcRequest({
+    endpoint: getRealtimeRpcEndpoint(env),
+    token: env.STELLAR_ARCHIVE_RPC_TOKEN,
+    authMode: getRpcAuthMode(env),
+    method: "getTransaction",
+    params: {
+      hash: txHash,
+      xdrFormat: "base64",
+    },
+  });
+
+  if (!result || result.status === "NOT_FOUND" || result.status !== "FAILED") {
+    return null;
+  }
+
+  if (
+    typeof result.envelopeXdr !== "string" ||
+    typeof result.resultXdr !== "string" ||
+    (typeof result.ledger !== "number" && typeof result.ledger !== "string")
+  ) {
+    return null;
+  }
+
+  const envelopeJson = xdrToJson(
+    xdr.TransactionEnvelope.fromXDR(result.envelopeXdr, "base64"),
+  );
+  const resultJson = xdrToJson(
+    xdr.TransactionResult.fromXDR(result.resultXdr, "base64"),
+  ) as Record<string, unknown>;
+  const metaJson = typeof result.resultMetaXdr === "string"
+    ? xdrToJson(xdr.TransactionMeta.fromXDR(result.resultMetaXdr, "base64"))
+    : null;
+  const diagnosticEvents = parseDiagnosticEventsXdr(result.diagnosticEventsXdr);
+
+  const processing = {
+    result: {
+      transaction_hash: txHash,
+      result: resultJson ?? {},
+    },
+    tx_apply_processing: normalizeTransactionMeta(metaJson, diagnosticEvents),
+  };
+
+  return buildFailedSorobanTransaction(
+    envelopeJson,
+    processing,
+    result.ledger,
+    typeof result.createdAt === "number"
+      ? result.createdAt
+      : result.latestLedgerCloseTime ?? new Date().toISOString(),
+  );
 }
 
 // --- Scan Orchestrator ---

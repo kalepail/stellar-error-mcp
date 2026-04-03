@@ -165,8 +165,6 @@ npm run deploy
 
 **`search_errors`** — Return raw matching AI Search chunks without synthesized analysis. Supports metadata filters aligned with the `search-docs/` schema.
 
-**`list_errors`** — List stored error/example objects in R2.
-
 ## Project structure
 
 ```
@@ -200,10 +198,10 @@ AI Search and analysis models are configured separately in `wrangler.jsonc` unde
 ## R2 layout
 
 - `errors/<fingerprint>.json`: canonical structured error records
-- `examples/<fingerprint>.json`: stored example transactions and contract snapshots
+- `reference-transactions/<fingerprint>.json`: stored example transactions and contract snapshots
 - `jobs/<jobId>.json`: public async job snapshots
 - `job-inputs/<jobId>.json`: private Workflow inputs and staged-artifact references
 - `job-results/<jobId>.json`: larger batch result artifacts
 - `job-staging/<jobId>/...`: staged Workflow transaction artifacts and step results
-- `tx-index/<txHash>.json`: direct tx-hash to fingerprint pointers
+- KV `tx:<txHash>`: direct tx-hash to fingerprint pointers
 - `search-docs/<fingerprint>.md`: the only documents intended for AI Search indexing

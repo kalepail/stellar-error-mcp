@@ -39,9 +39,10 @@ function createBaseServer(env: Env) {
         ),
     },
     async ({ error_message, contract_id, operation_type }) => {
+      let queryText = error_message;
+
       try {
         // If the input looks like base64 XDR, decode it first for a richer query
-        let queryText = error_message;
         const isBase64 =
           error_message.length > 40 &&
           /^[A-Za-z0-9+/]+=*$/.test(error_message.trim());
@@ -71,6 +72,17 @@ function createBaseServer(env: Env) {
             }),
           });
 
+        if ((answer.data ?? []).length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: "## Diagnosis\n\nNo indexed documents found for this query.",
+              },
+            ],
+          };
+        }
+
         const response = answer.response ?? "No matching errors found.";
         const sources = (answer.data ?? [])
           .map(
@@ -95,7 +107,7 @@ function createBaseServer(env: Env) {
           content: [
             {
               type: "text" as const,
-              text: `Error searching knowledge base: ${message}`,
+              text: `AI Search query failed: ${message}`,
             },
           ],
         };
@@ -287,6 +299,7 @@ function createBaseServer(env: Env) {
               errorCategory: error_category,
             }),
           });
+
         return {
           content: [
             {
@@ -310,7 +323,10 @@ function createBaseServer(env: Env) {
         return {
           isError: true,
           content: [
-            { type: "text" as const, text: `Search error: ${message}` },
+            {
+              type: "text" as const,
+              text: `AI Search query failed: ${message}`,
+            },
           ],
         };
       }
@@ -400,64 +416,6 @@ function createBaseServer(env: Env) {
           isError: true,
           content: [
             { type: "text" as const, text: `XDR decode error: ${message}` },
-          ],
-        };
-      }
-    },
-  );
-
-  // --- Tool: list_errors ---
-  // List stored error files — useful for Codemode
-  server.tool(
-    "list_errors",
-    "List deduplicated error entries stored in R2. Returns filenames, sizes, and upload dates.",
-    {
-      prefix: z
-        .string()
-        .optional()
-        .default("search-docs/")
-        .describe("File prefix ('search-docs/', 'errors/', 'examples/', or 'tx-index/')"),
-      limit: z
-        .number()
-        .optional()
-        .default(100)
-        .describe("Max files to list"),
-    },
-    async ({ prefix, limit }) => {
-      try {
-        const effectivePrefix = prefix ?? "search-docs/";
-        const effectiveLimit = Math.min(limit ?? 100, 1000);
-
-        const listed = await env.ERRORS_BUCKET.list({
-          prefix: effectivePrefix,
-          limit: effectiveLimit,
-        });
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                listed.objects.map((obj) => ({
-                  key: obj.key,
-                  size: obj.size,
-                  uploaded: obj.uploaded.toISOString(),
-                })),
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : String(error);
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text" as const,
-              text: `List error: ${message}`,
-            },
           ],
         };
       }

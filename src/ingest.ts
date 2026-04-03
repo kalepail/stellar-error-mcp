@@ -6,11 +6,12 @@ import type {
   FailedTransaction,
 } from "./types.js";
 import {
+  deleteErrorEntryArtifacts,
+  deleteExampleTransaction,
   bumpErrorEntry,
   findSimilarError,
   findErrorEntryByTxHash,
   getErrorEntry,
-  getExampleTransaction,
   indexErrorVector,
   storeErrorEntry,
   storeExampleTransaction,
@@ -19,6 +20,7 @@ import {
 import { analyzeFailedTransaction } from "./analysis.js";
 import { buildErrorDescription, buildFingerprint } from "./fingerprint.js";
 import { buildContractContext, fetchContractsForError } from "./contracts.js";
+import { ensureExampleTransaction } from "./reference-transactions.js";
 import { attachDeepDecodedViews } from "./transaction.js";
 
 export interface IngestFailedTransactionResult {
@@ -55,7 +57,7 @@ export async function ingestFailedTransaction(
       status: "duplicate",
       fingerprint: existingByTxHash.fingerprint,
       entry: existingByTxHash,
-      example: await getExampleTransaction(env, existingByTxHash.fingerprint),
+      example: await ensureExampleTransaction(env, existingByTxHash.fingerprint),
     };
   }
 
@@ -89,7 +91,7 @@ export async function ingestFailedTransaction(
         txHashes: [...existing.txHashes.filter((h) => h !== tx.txHash), tx.txHash].slice(-50),
         lastSeen: tx.ledgerCloseTime,
       },
-      example: await getExampleTransaction(env, fingerprint),
+      example: await ensureExampleTransaction(env, fingerprint, tx),
     };
   }
 
@@ -178,14 +180,28 @@ export async function ingestFailedTransaction(
     contractContext: contractContext ?? undefined,
   };
 
-  await storeErrorEntry(env, entry);
-  await storeTxHashPointer(env, enrichedTx.txHash, fingerprint);
-  await storeExampleTransaction(
-    env,
-    enrichedTx,
-    fingerprint,
-    contracts ? [...contracts.values()] : [],
-  );
+  let storedExample = false;
+  let storedEntry = false;
+  try {
+    await storeExampleTransaction(
+      env,
+      enrichedTx,
+      fingerprint,
+      contracts ? [...contracts.values()] : [],
+    );
+    storedExample = true;
+    await storeErrorEntry(env, entry);
+    storedEntry = true;
+    await storeTxHashPointer(env, enrichedTx.txHash, fingerprint);
+  } catch (error) {
+    if (storedEntry) {
+      await deleteErrorEntryArtifacts(env, fingerprint).catch(() => undefined);
+    }
+    if (storedExample) {
+      await deleteExampleTransaction(env, fingerprint).catch(() => undefined);
+    }
+    throw error;
+  }
 
   try {
     await indexErrorVector(env, fingerprint, description, {
@@ -217,6 +233,6 @@ export async function ingestFailedTransaction(
     status: "new",
     fingerprint,
     entry,
-    example: await getExampleTransaction(env, fingerprint),
+    example: await ensureExampleTransaction(env, fingerprint, enrichedTx),
   };
 }
