@@ -9,7 +9,8 @@
     "provision:ai-search": "node scripts/provision-ai-search.mjs",
     "types": "wrangler types",
     "check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:live-rpc": "vitest run tests/live-rpc.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.28.0",

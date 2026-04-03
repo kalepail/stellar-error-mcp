@@ -8,6 +8,7 @@ import type {
   Env,
 } from "./types.js";
 import { decodeXdrStream } from "./xdr.js";
+import { getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
 
 const { Spec } = contract;
 
@@ -151,32 +152,14 @@ async function rpcGetLedgerEntries(
   env: Env,
   keys: xdr.LedgerKey[],
 ): Promise<any[]> {
-  const response = await fetch(env.STELLAR_ARCHIVE_RPC_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${env.STELLAR_ARCHIVE_RPC_TOKEN}`,
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 0,
-      method: "getLedgerEntries",
-      params: { keys: keys.map((k) => k.toXDR("base64")) },
-    }),
+  const result = await rpcRequest({
+    endpoint: getRealtimeRpcEndpoint(env),
+    token: env.STELLAR_ARCHIVE_RPC_TOKEN,
+    authMode: getRpcAuthMode(env),
+    method: "getLedgerEntries",
+    params: { keys: keys.map((k) => k.toXDR("base64")) },
   });
-
-  if (!response.ok) {
-    throw new Error(`getLedgerEntries HTTP ${response.status}`);
-  }
-
-  const json: any = await response.json();
-  if (json.error) {
-    throw new Error(
-      `getLedgerEntries error: ${json.error.message || JSON.stringify(json.error)}`,
-    );
-  }
-
-  return json.result?.entries ?? [];
+  return result?.entries ?? [];
 }
 
 // --- Fetch Contract Metadata ---
