@@ -59,7 +59,9 @@ describe("ai search helpers", () => {
     });
     expect(document.content).toContain("## Detailed Analysis");
     expect(document.content).toContain("## Error Signatures");
+    expect(document.content).toContain("## Search Aliases");
     expect(document.content).toContain("host:Auth.InvalidAction");
+    expect(document.content).toContain("contract_error_price_too_low");
   });
 
   it("always scopes filters to the search-docs folder", () => {

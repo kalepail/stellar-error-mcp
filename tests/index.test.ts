@@ -332,6 +332,40 @@ describe("worker fetch routes", () => {
     expect(env.LEDGER_RANGE_WORKFLOW.created).toHaveLength(0);
   });
 
+  it("clears a stale recurring scan record when workflow lookup says instance.not_found", async () => {
+    const env = createTestEnv();
+    const job: AsyncJob = {
+      jobId: "rs_stalejob",
+      kind: "recurring_scan",
+      status: "running",
+      phase: "scanning",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:01:00.000Z",
+      progress: { completed: 5, total: 200, unit: "ledgers" },
+      workflowStatus: "running",
+    };
+    await storeAsyncJob(env, job);
+    await setActiveRecurringScanRecord(env, {
+      jobId: job.jobId,
+      updatedAt: job.updatedAt,
+    });
+    syncJobWithWorkflowStatus.mockRejectedValueOnce(new Error("instance.not_found"));
+
+    const { default: worker } = await import("../src/index.js");
+    const response = await worker.fetch(
+      new Request("http://localhost/trigger", { method: "POST" }),
+      env,
+      { waitUntil: () => undefined } as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      jobId: "rs_generated",
+      reused: false,
+    });
+    expect(env.LEDGER_RANGE_WORKFLOW.created).toHaveLength(1);
+  });
+
   it("creates a batch workflow job", async () => {
     const env = createTestEnv();
     const { default: worker } = await import("../src/index.js");

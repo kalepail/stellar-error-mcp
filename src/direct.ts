@@ -59,6 +59,51 @@ function parseResultXdr(xdrBase64: string): unknown {
   );
 }
 
+function normalizeTxResultKind(value: string): string {
+  return normalizeCode(
+    value.replace(/([a-z0-9])([A-Z])/g, "$1_$2"),
+  );
+}
+
+function extractTxResultSwitchName(value: unknown): string | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractTxResultSwitchName(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (!isRecord(value)) return null;
+
+  const maybeSwitch = value._switch;
+  if (isRecord(maybeSwitch) && typeof maybeSwitch.name === "string") {
+    if (/^tx(?:_|[A-Z])/.test(maybeSwitch.name)) {
+      return maybeSwitch.name;
+    }
+  }
+
+  for (const inner of Object.values(value)) {
+    const found = extractTxResultSwitchName(inner);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function extractRpcSendResultKind(resultJson: unknown): string | null {
+  const directKey = findMatchingKey(
+    resultJson,
+    (key) => /^tx(?:_|[A-Z])/.test(key),
+  );
+  if (directKey) {
+    return normalizeTxResultKind(directKey);
+  }
+
+  const switchName = extractTxResultSwitchName(resultJson);
+  return switchName ? normalizeTxResultKind(switchName) : null;
+}
+
 function parseDiagnosticEvents(events: unknown): unknown[] {
   if (!Array.isArray(events)) return [];
   return events
@@ -281,7 +326,7 @@ export async function buildFailedTransactionFromDirectError(
       ? submission.response.errorResult
       : null;
     const resultKind = resultJson
-      ? findMatchingKey(resultJson, (key) => key.startsWith("tx"))
+      ? extractRpcSendResultKind(resultJson)
       : null;
     const diagnosticEvents = parseDiagnosticEvents(
       submission.response.diagnosticEventsXdr ?? submission.response.diagnosticEvents,

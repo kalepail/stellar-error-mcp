@@ -564,16 +564,19 @@ export async function scanForFailedTransactions(
   const failLimit = maxFailed ?? MAX_FAILED_PER_CYCLE;
 
   while (pagesScanned < maxPages && allFailed.length < failLimit) {
+    const remainingLedgers = maxLedgers - ledgersScanned;
+    if (remainingLedgers <= 0) break;
+
     pagesScanned++;
 
     const result = await fetchLedgerRange(
       env,
       startLedger,
-      LEDGER_PAGE_SIZE,
+      Math.min(LEDGER_PAGE_SIZE, remainingLedgers),
       cursor,
     );
 
-    const ledgers = result.ledgers ?? [];
+    const ledgers = (result.ledgers ?? []).slice(0, remainingLedgers);
     ledgersScanned += ledgers.length;
 
     const failed = extractFailedSorobanTransactions(ledgers);

@@ -96,6 +96,55 @@ describe("stellar archive RPC auth", () => {
     fetchMock.mockRestore();
   });
 
+  it("does not scan beyond the requested ledger count", async () => {
+    const { scanForFailedTransactions } = await import("../src/stellar.js");
+    const env = createTestEnv();
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        result: {
+          ledgers: [
+            { sequence: 25 },
+            { sequence: 26 },
+            { sequence: 27 },
+            { sequence: 28 },
+            { sequence: 29 },
+          ],
+          cursor: "next-page",
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const result = await scanForFailedTransactions(env, 25, 1);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://archive-rpc.example.com",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 0,
+          method: "getLedgers",
+          params: {
+            startLedger: 25,
+            pagination: { limit: 1 },
+            xdrFormat: "json",
+          },
+        }),
+      }),
+    );
+    expect(result).toMatchObject({
+      ledgersScanned: 1,
+      pagesScanned: 1,
+      lastLedgerProcessed: 25,
+    });
+
+    fetchMock.mockRestore();
+  });
+
   it("rebuilds a failed transaction from getTransaction", async () => {
     const { getFailedTransactionByHash } = await import("../src/stellar.js");
     const env = createTestEnv();

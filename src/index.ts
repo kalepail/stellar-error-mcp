@@ -61,6 +61,11 @@ function timingSafeEqual(a: string, b: string): boolean {
   return mismatch === 0;
 }
 
+function isWorkflowInstanceMissing(error: unknown): boolean {
+  const message = formatError(error);
+  return message.includes("instance.not_found");
+}
+
 function getManagementTokenFromRequest(request: Request): string | null {
   const authorization = request.headers.get("authorization");
   if (authorization) {
@@ -278,9 +283,15 @@ async function startOrReuseRecurringScanJob(
   if (active?.jobId) {
     const current = await getAsyncJob(env, active.jobId);
     if (current) {
-      const synced = await syncJobWithWorkflowStatus(env, current);
-      if (!isTerminalJobStatus(synced.status)) {
-        return { job: synced, reused: true };
+      try {
+        const synced = await syncJobWithWorkflowStatus(env, current);
+        if (!isTerminalJobStatus(synced.status)) {
+          return { job: synced, reused: true };
+        }
+      } catch (error) {
+        if (!isWorkflowInstanceMissing(error)) {
+          throw error;
+        }
       }
     }
     await setActiveRecurringScanRecord(env, null);

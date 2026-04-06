@@ -9,6 +9,11 @@ import {
 } from "./storage.js";
 import { buildAiSearchFilters } from "./ai-search.js";
 import { sanitizeExampleTransaction } from "./jobs.js";
+import {
+  buildStoredDiagnosisText,
+  buildStoredSearchResult,
+  findExactErrorEntryForQuery,
+} from "./mcp-lookup.js";
 import { decodeXdr, decodeXdrWithType, guessXdrType } from "./xdr.js";
 
 function createBaseServer(env: Env) {
@@ -42,6 +47,18 @@ function createBaseServer(env: Env) {
       let queryText = error_message;
 
       try {
+        const exactMatch = await findExactErrorEntryForQuery(env, error_message);
+        if (exactMatch) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: buildStoredDiagnosisText(exactMatch),
+              },
+            ],
+          };
+        }
+
         // If the input looks like base64 XDR, decode it first for a richer query
         const isBase64 =
           error_message.length > 40 &&
@@ -285,6 +302,32 @@ function createBaseServer(env: Env) {
       max_results,
     }) => {
       try {
+        if (fingerprint) {
+          const exactEntry = await getErrorEntry(env, fingerprint);
+          if (exactEntry) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(buildStoredSearchResult(exactEntry), null, 2),
+                },
+              ],
+            };
+          }
+        }
+
+        const exactMatch = await findExactErrorEntryForQuery(env, query);
+        if (exactMatch) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(buildStoredSearchResult(exactMatch), null, 2),
+              },
+            ],
+          };
+        }
+
         const results = await (env.AI as any)
           .autorag(env.AI_SEARCH_INSTANCE)
           .search({

@@ -10,23 +10,27 @@
   "r2_buckets": [
     {
       "binding": "ERRORS_BUCKET",
-      "bucket_name": "stellar-errors"
+      "bucket_name": "stellar-errors",
+      "remote": true
     },
     {
       "binding": "WORKFLOW_ARTIFACTS_BUCKET",
-      "bucket_name": "stellar-error-runtime"
+      "bucket_name": "stellar-error-runtime",
+      "remote": true
     }
   ],
   "kv_namespaces": [
     {
       "binding": "CURSOR_KV",
-      "id": "8ac837a682ce44558a8b8f1337acc998"
+      "id": "8ac837a682ce44558a8b8f1337acc998",
+      "remote": true
     }
   ],
   "vectorize": [
     {
       "binding": "VECTORIZE",
-      "index_name": "stellar-error-fingerprints"
+      "index_name": "stellar-error-fingerprints",
+      "remote": true
     }
   ],
   "ai": {
