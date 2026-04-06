@@ -1,21 +1,69 @@
 import { describe, expect, it, vi } from "vitest";
 import { createTestEnv } from "./helpers.js";
 
+vi.mock("@stellar/stellar-sdk", () => ({
+  xdr: {
+    TransactionEnvelope: {
+      fromXDR: vi.fn(() => ({
+        tx: {
+          tx: {
+            operations: [
+              {
+                body: {
+                  invoke_host_function: {
+                    host_function: {
+                      invoke_contract: {
+                        contract_address: "C1",
+                        function_name: "transfer",
+                      },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      })),
+    },
+    TransactionResult: {
+      fromXDR: vi.fn(() => ({
+        result: {
+          tx_failed: {},
+        },
+      })),
+    },
+    TransactionMeta: {
+      fromXDR: vi.fn(() => ({
+        v4: {
+          operations: [],
+          events: [],
+          soroban_meta: null,
+        },
+      })),
+    },
+    DiagnosticEvent: {
+      fromXDR: vi.fn(() => ({
+        error: { contract: 10 },
+      })),
+    },
+  },
+}));
+
 vi.mock("../src/transaction.js", () => ({
   buildDecodedTransactionContext: () => ({
     topLevelFunction: "transfer",
-    errorSignatures: [],
-    invokeCalls: [],
+    errorSignatures: [{ type: "contract", code: "10" }],
+    invokeCalls: [{ contractId: "C1", functionName: "transfer" }],
     authEntries: [],
     resourceLimits: null,
     transactionResult: null,
     sorobanMeta: null,
     contractEvents: [],
-    diagnosticEvents: [],
+    diagnosticEvents: [{ error: { contract: 10 } }],
     envelopeOperations: [],
     processingOperations: [],
     ledgerChanges: [],
-    touchedContractIds: [],
+    touchedContractIds: ["C1"],
   }),
 }));
 
@@ -41,6 +89,107 @@ describe("stellar archive RPC auth", () => {
       expect.objectContaining({
         headers: expect.not.objectContaining({
           Authorization: expect.anything(),
+        }),
+      }),
+    );
+
+    fetchMock.mockRestore();
+  });
+
+  it("does not scan beyond the requested ledger count", async () => {
+    const { scanForFailedTransactions } = await import("../src/stellar.js");
+    const env = createTestEnv();
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        result: {
+          ledgers: [
+            { sequence: 25 },
+            { sequence: 26 },
+            { sequence: 27 },
+            { sequence: 28 },
+            { sequence: 29 },
+          ],
+          cursor: "next-page",
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const result = await scanForFailedTransactions(env, 25, 1);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://archive-rpc.example.com",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 0,
+          method: "getLedgers",
+          params: {
+            startLedger: 25,
+            pagination: { limit: 1 },
+            xdrFormat: "json",
+          },
+        }),
+      }),
+    );
+    expect(result).toMatchObject({
+      ledgersScanned: 1,
+      pagesScanned: 1,
+      lastLedgerProcessed: 25,
+    });
+
+    fetchMock.mockRestore();
+  });
+
+  it("rebuilds a failed transaction from getTransaction", async () => {
+    const { getFailedTransactionByHash } = await import("../src/stellar.js");
+    const env = createTestEnv();
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        result: {
+          status: "FAILED",
+          txHash: "tx-restore-1",
+          ledger: 321,
+          createdAt: 1712016000,
+          latestLedgerCloseTime: 1712016005,
+          envelopeXdr: "AAAA",
+          resultXdr: "BBBB",
+          resultMetaXdr: "CCCC",
+          diagnosticEventsXdr: ["DDDD"],
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const tx = await getFailedTransactionByHash(env, "tx-restore-1");
+
+    expect(tx).toMatchObject({
+      txHash: "tx-restore-1",
+      ledgerSequence: 321,
+      resultKind: "tx_failed",
+      contractIds: ["C1"],
+      primaryContractIds: ["C1"],
+      ledgerCloseTime: "1712016000",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://rpc.example.com",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 0,
+          method: "getTransaction",
+          params: {
+            hash: "tx-restore-1",
+            xdrFormat: "base64",
+          },
         }),
       }),
     );

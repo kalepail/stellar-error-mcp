@@ -4,6 +4,7 @@ import { NonRetryableError } from "cloudflare:workflows";
 import { ingestFailedTransaction } from "./ingest.js";
 import { updateJob, sanitizeExampleTransaction, workflowStatusToAsyncStatus } from "./jobs.js";
 import {
+  cleanupTransientArtifactsForJob,
   getActiveDirectJob,
   getActiveRecurringScanRecord,
   getAsyncJob,
@@ -306,6 +307,15 @@ export class DirectErrorWorkflow extends WorkflowEntrypoint<
         return { resultKey: "ingest-direct-error" };
       });
 
+      const result = await getJobStepResult<DirectErrorJobResult>(
+        this.env,
+        jobId,
+        "ingest-direct-error",
+      );
+      if (!result) {
+        throw new NonRetryableError("Direct workflow result missing during finalization.");
+      }
+
       await step.do("finalize-direct-job", async () => {
         const result = await getJobStepResult<DirectErrorJobResult>(
           this.env,
@@ -323,14 +333,11 @@ export class DirectErrorWorkflow extends WorkflowEntrypoint<
           result,
         });
         await clearDirectJobIfNeeded(this.env, input.txHash, jobId);
+        await cleanupTransientArtifactsForJob(this.env, jobId);
         return null;
       });
 
-      return await getJobStepResult<DirectErrorJobResult>(
-        this.env,
-        jobId,
-        "ingest-direct-error",
-      );
+      return result;
     } catch (error) {
       await step.do("finalize-direct-failure", async () => {
         await finalizeFailedJob(this.env, jobId, error);
@@ -338,6 +345,7 @@ export class DirectErrorWorkflow extends WorkflowEntrypoint<
         if (input && typeof input === "object" && "txHash" in input && typeof input.txHash === "string") {
           await clearDirectJobIfNeeded(this.env, input.txHash, jobId);
         }
+        await cleanupTransientArtifactsForJob(this.env, jobId);
         return null;
       });
       throw error;
@@ -475,6 +483,7 @@ export class LedgerRangeWorkflow extends WorkflowEntrypoint<
         });
 
         await clearRecurringScanIfNeeded(this.env, jobId);
+        await cleanupTransientArtifactsForJob(this.env, jobId);
         return publicResult;
       });
 
@@ -483,6 +492,7 @@ export class LedgerRangeWorkflow extends WorkflowEntrypoint<
       await step.do("finalize-ledger-failure", async () => {
         await finalizeFailedJob(this.env, jobId, error);
         await clearRecurringScanIfNeeded(this.env, jobId);
+        await cleanupTransientArtifactsForJob(this.env, jobId);
         return null;
       });
       throw error;

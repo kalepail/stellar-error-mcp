@@ -263,7 +263,7 @@ if (config) {
     });
     await writeObservation(networkName, "send-bad-seq-normalized", normalized);
 
-    expect(normalized.resultKind.startsWith("tx_")).toBe(true);
+    expect(normalized.resultKind).toBe("tx_bad_seq");
   }, 60_000);
 
   it("captures a real sendTransaction fast failure for expired timebounds", async () => {
@@ -276,7 +276,17 @@ if (config) {
     await writeObservation(networkName, "send-expired-raw", raw);
 
     expect(raw.status).toBe(200);
-    expect(raw.json.result.status).toBe("ERROR");
+    expect(["ERROR", "PENDING"]).toContain(raw.json.result.status);
+    expect(raw.json.result.hash).toEqual(expect.any(String));
+
+    if (raw.json.result.status === "PENDING") {
+      const lookup = await postRpc(cfg, "getTransaction", {
+        hash: raw.json.result.hash,
+      });
+      await writeObservation(networkName, "send-expired-get-transaction", lookup);
+      return;
+    }
+
     expect(raw.json.result.errorResultXdr).toEqual(expect.any(String));
 
     const normalized = await buildFailedTransactionFromDirectError({

@@ -10,19 +10,27 @@
   "r2_buckets": [
     {
       "binding": "ERRORS_BUCKET",
-      "bucket_name": "stellar-errors"
+      "bucket_name": "stellar-errors",
+      "remote": true
+    },
+    {
+      "binding": "WORKFLOW_ARTIFACTS_BUCKET",
+      "bucket_name": "stellar-error-runtime",
+      "remote": true
     }
   ],
   "kv_namespaces": [
     {
       "binding": "CURSOR_KV",
-      "id": "8ac837a682ce44558a8b8f1337acc998"
+      "id": "8ac837a682ce44558a8b8f1337acc998",
+      "remote": true
     }
   ],
   "vectorize": [
     {
       "binding": "VECTORIZE",
-      "index_name": "stellar-error-fingerprints"
+      "index_name": "stellar-error-fingerprints",
+      "remote": true
     }
   ],
   "ai": {
@@ -52,7 +60,8 @@
     "STELLAR_RPC_AUTH_MODE": "header",
     "AI_SEARCH_INSTANCE": "stellar-errors",
     "AI_SEARCH_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-    "AI_ANALYSIS_MODEL": "@cf/moonshotai/kimi-k2.5"
+    "AI_ANALYSIS_MODEL": "@cf/moonshotai/kimi-k2.5",
+    "JOB_RETENTION_HOURS": "72"
   },
   "observability": {
     "enabled": true,

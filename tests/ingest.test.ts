@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createTestEnv } from "./helpers.js";
+import { createTestEnv, MemoryR2Bucket } from "./helpers.js";
 import { ingestFailedTransaction } from "../src/ingest.js";
 import { getErrorEntry } from "../src/storage.js";
 import type { FailedTransaction } from "../src/types.js";
@@ -89,5 +89,31 @@ describe("ingest idempotency", () => {
     const stored = await getErrorEntry(env, first.fingerprint);
     expect(stored?.seenCount).toBe(1);
     expect(stored?.txHashes).toEqual(["tx-1"]);
+  });
+
+  it("rolls back the stored example if the canonical error write fails", async () => {
+    class FailingErrorsBucket extends MemoryR2Bucket {
+      override async put(key: string, value: string, options?: R2PutOptions): Promise<void> {
+        if (key.startsWith("errors/")) {
+          throw new Error("simulated write failure");
+        }
+        await super.put(key, value, options);
+      }
+    }
+
+    const bucket = new FailingErrorsBucket();
+    const workflowBucket = createTestEnv().WORKFLOW_ARTIFACTS_BUCKET;
+    const env = createTestEnv(bucket, workflowBucket);
+
+    await expect(ingestFailedTransaction(env, createFailedTx("tx-rollback"))).rejects.toThrow(
+      "simulated write failure",
+    );
+
+    expect(
+      [...bucket.objects.keys()].filter((key) => key.startsWith("reference-transactions/")),
+    ).toEqual([]);
+    expect(
+      [...bucket.objects.keys()].filter((key) => key.startsWith("errors/")),
+    ).toEqual([]);
   });
 });

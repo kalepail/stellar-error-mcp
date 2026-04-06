@@ -49,6 +49,36 @@ function paragraphSection(title: string, value?: string): string[] {
   return [`## ${title}`, cleaned, ""];
 }
 
+function normalizeAlias(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^A-Za-z0-9]+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function buildSearchAliases(entry: ErrorEntry): string[] {
+  const rawValues = [
+    entry.resultKind,
+    entry.errorCategory,
+    ...entry.relatedCodes,
+    ...entry.errorSignatures.map((signature) => `${signature.type}:${signature.code}`),
+  ].filter((value) => value.trim().length > 0);
+
+  const aliases = new Set<string>();
+  for (const value of rawValues) {
+    aliases.add(value);
+
+    const normalized = normalizeAlias(value);
+    if (normalized) {
+      aliases.add(normalized);
+      aliases.add(normalized.replace(/\s+/g, "_"));
+    }
+  }
+
+  return [...aliases];
+}
+
 export function buildSearchDocument(entry: ErrorEntry): SearchDocumentRecord {
   const primaryContract = entry.contractIds[0] ?? "";
   const operationType = entry.sorobanOperationTypes[0] ?? "";
@@ -56,6 +86,7 @@ export function buildSearchDocument(entry: ErrorEntry): SearchDocumentRecord {
   const signatureLines = entry.errorSignatures.map((signature) =>
     `${signature.type}:${signature.code}`
   );
+  const searchAliases = buildSearchAliases(entry);
   const metadata: SearchDocumentMetadata = {
     fingerprint: entry.fingerprint,
     error_category: entry.errorCategory,
@@ -80,6 +111,7 @@ export function buildSearchDocument(entry: ErrorEntry): SearchDocumentRecord {
     `Last seen: ${entry.lastSeen}`,
     `Example transaction: ${entry.exampleTxHash}`,
     "",
+    ...listSection("Search Aliases", searchAliases),
     ...paragraphSection("Likely Cause", entry.likelyCause),
     ...paragraphSection("Suggested Fix", entry.suggestedFix),
     ...paragraphSection("Detailed Analysis", entry.detailedAnalysis),

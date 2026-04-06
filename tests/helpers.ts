@@ -57,6 +57,13 @@ export class MemoryR2Bucket {
     } as unknown as R2Objects;
   }
 
+  async delete(keys: string | string[]): Promise<void> {
+    const list = Array.isArray(keys) ? keys : [keys];
+    for (const key of list) {
+      this.objects.delete(key);
+    }
+  }
+
   getJson(key: string): unknown {
     const stored = this.objects.get(key);
     return stored ? JSON.parse(stored.body) : null;
@@ -117,8 +124,10 @@ export class MemoryKVNamespace {
 
 export function createTestEnv(
   bucket = new MemoryR2Bucket(),
+  workflowBucket = new MemoryR2Bucket(),
 ): Env & {
   ERRORS_BUCKET: MemoryR2Bucket;
+  WORKFLOW_ARTIFACTS_BUCKET: MemoryR2Bucket;
   CURSOR_KV: MemoryKVNamespace;
   DIRECT_ERROR_WORKFLOW: MemoryWorkflowBinding<{ jobId: string }>;
   LEDGER_RANGE_WORKFLOW: MemoryWorkflowBinding<{ jobId: string }>;
@@ -128,6 +137,7 @@ export function createTestEnv(
   const ledgerWorkflow = new MemoryWorkflowBinding<{ jobId: string }>();
   return {
     ERRORS_BUCKET: bucket,
+    WORKFLOW_ARTIFACTS_BUCKET: workflowBucket,
     CURSOR_KV: kv as unknown as KVNamespace,
     VECTORIZE: {
       query: async () => ({ count: 0, matches: [] }),
@@ -149,5 +159,6 @@ export function createTestEnv(
     AI_SEARCH_INSTANCE: "search",
     AI_SEARCH_MODEL: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     AI_ANALYSIS_MODEL: "@cf/moonshotai/kimi-k2.5",
+    JOB_RETENTION_HOURS: "72",
   };
 }

@@ -140,6 +140,38 @@ describe("direct error normalization", () => {
     });
   });
 
+  it("extracts tx result codes from switch-name based XDR JSON", async () => {
+    const stellar = await import("@stellar/stellar-sdk");
+    vi.mocked(stellar.xdr.TransactionResult.fromXDR).mockReturnValueOnce({
+      _attributes: {
+        result: {
+          _switch: {
+            name: "txBadAuth",
+            value: -6,
+          },
+        },
+      },
+    } as never);
+
+    const { buildFailedTransactionFromDirectError } = await import("../src/direct.js");
+
+    const tx = await buildFailedTransactionFromDirectError({
+      kind: "rpc_send",
+      transactionXdr: "AAAA",
+      response: {
+        status: "ERROR",
+        hash: "abc456",
+        latestLedger: 123,
+        errorResultXdr: "DDDD",
+      },
+    });
+
+    expect(tx.resultKind).toBe("tx_bad_auth");
+    expect(tx.decoded.errorSignatures).toEqual([
+      { type: "result", code: "tx_bad_auth" },
+    ]);
+  });
+
   it("parses rpc simulate failures into failed transactions", async () => {
     const { buildFailedTransactionFromDirectError } = await import("../src/direct.js");
 
