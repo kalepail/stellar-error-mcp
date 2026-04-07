@@ -57,6 +57,24 @@ STELLAR_RPC_AUTH_MODE=header
 
 `STELLAR_ARCHIVE_RPC_TOKEN` is reused for both archive and real-time RPC by default. If you prefer URL-path auth, set `STELLAR_RPC_AUTH_MODE=path`.
 
+Optional testnet defaults for direct error submissions:
+
+```
+STELLAR_TESTNET_RPC_ENDPOINT=https://your-testnet-rpc.example.com
+STELLAR_TESTNET_ARCHIVE_RPC_ENDPOINT=https://your-testnet-archive-rpc.example.com
+STELLAR_TESTNET_RPC_TOKEN=optional_testnet_token
+STELLAR_TESTNET_RPC_AUTH_MODE=header
+```
+
+Optional analysis controls:
+
+```
+AI_ANALYSIS_TIMEOUT_MS=3600000
+AI_ANALYSIS_MAX_DURATION_MS=3600000
+```
+
+`AI_ANALYSIS_MODEL` is treated as authoritative for final diagnosis. The Worker retries that model until the max duration window is exhausted and does not fall back to a smaller-context model.
+
 For deployed admin endpoints, also set a management token secret:
 
 ```bash
@@ -107,6 +125,28 @@ curl -X POST http://localhost:8787/forward-error \
     }
   }'
 ```
+
+To force a fresh analysis for an exact duplicate, send `forceReanalyze: true` in the JSON body. This is intended for admin use on `/forward-error` when you want to refresh stored analysis after decoder or contract-fetch changes.
+
+To analyze a direct error against testnet or another non-default RPC, include per-request RPC context:
+
+```json
+{
+  "kind": "rpc_simulate",
+  "network": "testnet",
+  "rpcEndpoint": "https://your-testnet-rpc.example.com",
+  "archiveRpcEndpoint": "https://your-testnet-archive-rpc.example.com",
+  "rpcAuthMode": "header",
+  "transactionXdr": "AAAA...",
+  "response": {
+    "error": "HostError: ...",
+    "events": ["AAAA..."]
+  }
+}
+```
+
+If `network` is `testnet` and explicit endpoints are omitted, the Worker will use `STELLAR_TESTNET_RPC_ENDPOINT` and `STELLAR_TESTNET_ARCHIVE_RPC_ENDPOINT` when configured.
+If those are not configured, direct testnet requests automatically fail over across the current public testnet RPC provider list from Stellar's provider docs. The Worker stores the last successful testnet endpoint in KV and tries that provider first on subsequent testnet requests.
 
 If the submission is an exact duplicate, the endpoint returns `200 { status: "duplicate", ... }` immediately.
 

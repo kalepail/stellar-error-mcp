@@ -6,9 +6,134 @@ import type {
   TransactionOperationContext,
   TransactionResourceLimits,
 } from "./types.js";
+import { StrKey } from "@stellar/stellar-sdk";
 import { deepDecodeXdr } from "./xdr.js";
 
 const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+const SOROBAN_OPERATION_TYPES = new Set([
+  "invoke_host_function",
+  "restore_footprint",
+  "extend_footprint_ttl",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function toSnakeCase(value: string): string {
+  return value
+    .replace(/Op$/, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/__+/g, "_")
+    .toLowerCase();
+}
+
+function decodeBufferLike(value: unknown): Buffer | null {
+  if (!isRecord(value)) return null;
+  if (value.type !== "Buffer" || !Array.isArray(value.data)) return null;
+
+  const bytes = value.data.filter((item): item is number =>
+    typeof item === "number" && Number.isInteger(item) && item >= 0 && item <= 255
+  );
+  return bytes.length === value.data.length ? Buffer.from(bytes) : null;
+}
+
+function decodeUtf8Buffer(value: unknown): string | null {
+  const buffer = decodeBufferLike(value);
+  if (!buffer) return null;
+  return buffer.toString("utf8").replace(/\0+$/g, "");
+}
+
+function decodeFunctionNameValue(value: unknown): string | null {
+  if (typeof value === "string" && value.length > 0) return value;
+  return decodeUtf8Buffer(value);
+}
+
+function decodeContractIdValue(value: unknown): string | null {
+  if (typeof value === "string" && CONTRACT_ID_PATTERN.test(value)) {
+    return value;
+  }
+
+  if (!isRecord(value)) return null;
+
+  if (
+    isRecord(value._switch) &&
+    typeof value._switch.name === "string" &&
+    value._switch.name === "scAddressTypeContract"
+  ) {
+    const buffer = decodeBufferLike(value._value);
+    return buffer ? StrKey.encodeContract(buffer) : null;
+  }
+
+  if (typeof value._arm === "string" && value._arm === "contractId") {
+    const buffer = decodeBufferLike(value._value);
+    return buffer ? StrKey.encodeContract(buffer) : null;
+  }
+
+  return null;
+}
+
+function normalizeSdkErrorToken(value: string): string {
+  const trimmed = value.replace(/^scec?/, "");
+  return toSnakeCase(trimmed).replace(/^_+|_+$/g, "");
+}
+
+function parseErrorLiteral(value: string): ErrorSignature | null {
+  const trimmed = value.trim();
+  const match = /^Error\(([^,]+),\s*([^)]+)\)$/.exec(trimmed);
+  if (!match) return null;
+
+  const family = normalizeSdkErrorToken(match[1] ?? "");
+  const codeRaw = (match[2] ?? "").trim();
+  if (!family || !codeRaw) return null;
+
+  const contractCode = /^#?\d+$/.exec(codeRaw);
+  if (contractCode) {
+    return {
+      type: family,
+      code: codeRaw.replace(/^#/, ""),
+    };
+  }
+
+  return {
+    type: family,
+    code: normalizeSdkErrorToken(codeRaw),
+  };
+}
+
+function extractSdkErrorSignature(value: unknown): ErrorSignature | null {
+  if (!isRecord(value) || !isRecord(value._switch) || !isRecord(value._value)) {
+    return null;
+  }
+
+  const family = value._switch.name;
+  const code = value._value.name;
+  if (
+    typeof family !== "string" ||
+    typeof code !== "string" ||
+    !family.startsWith("sce") ||
+    !code.startsWith("scec")
+  ) {
+    return null;
+  }
+
+  return {
+    type: normalizeSdkErrorToken(family),
+    code: normalizeSdkErrorToken(code),
+  };
+}
+
+function getRecordPath(
+  value: unknown,
+  path: string[],
+): unknown {
+  let current = value;
+  for (const segment of path) {
+    if (!isRecord(current)) return undefined;
+    current = current[segment];
+  }
+  return current;
+}
 
 export function walkJson(
   obj: unknown,
@@ -30,32 +155,12 @@ export function walkJson(
 export function collectContractIdsFromValue(obj: unknown): string[] {
   const ids = new Set<string>();
   walkJson(obj, (_key, value) => {
-    if (typeof value === "string" && CONTRACT_ID_PATTERN.test(value)) {
-      ids.add(value);
+    const contractId = decodeContractIdValue(value);
+    if (contractId) {
+      ids.add(contractId);
     }
   });
   return [...ids];
-}
-
-function collectErrors(value: unknown): Array<Record<string, unknown>> {
-  const results: Array<Record<string, unknown>> = [];
-  if (Array.isArray(value)) {
-    for (const item of value) results.push(...collectErrors(item));
-    return results;
-  }
-
-  if (!value || typeof value !== "object") return results;
-
-  const obj = value as Record<string, unknown>;
-  if ("error" in obj && obj.error !== null && obj.error !== undefined) {
-    results.push(obj.error as Record<string, unknown>);
-  }
-
-  for (const inner of Object.values(obj)) {
-    results.push(...collectErrors(inner));
-  }
-
-  return results;
 }
 
 function collectFunctionNames(value: unknown): string[] {
@@ -65,11 +170,18 @@ function collectFunctionNames(value: unknown): string[] {
     return results;
   }
 
-  if (!value || typeof value !== "object") return results;
+  if (!isRecord(value)) return results;
 
-  const obj = value as Record<string, unknown>;
+  const obj = value;
   if ("function_name" in obj && typeof obj.function_name === "string") {
     results.push(obj.function_name);
+  }
+  if ("functionName" in obj) {
+    const decoded = decodeFunctionNameValue(obj.functionName);
+    if (decoded) results.push(decoded);
+  }
+  if ("fn_name" in obj && typeof obj.fn_name === "string") {
+    results.push(obj.fn_name);
   }
 
   for (const inner of Object.values(obj)) {
@@ -82,23 +194,133 @@ function collectFunctionNames(value: unknown): string[] {
 export function extractErrorSignatures(
   diagnosticEvents: unknown[],
 ): ErrorSignature[] {
-  const errors = collectErrors(diagnosticEvents);
   const seen = new Set<string>();
   const signatures: ErrorSignature[] = [];
 
-  for (const err of errors) {
-    for (const [type, code] of Object.entries(err)) {
-      const signature = { type, code: String(code) };
-      const key = `${signature.type}:${signature.code}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      signatures.push(signature);
+  const visit = (value: unknown): void => {
+    if (typeof value === "string") {
+      const parsed = parseErrorLiteral(value);
+      if (parsed) {
+        const key = `${parsed.type}:${parsed.code}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          signatures.push(parsed);
+        }
+      }
+      return;
     }
-  }
+
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+
+    if (!isRecord(value)) return;
+
+    if ("error" in value && isRecord(value.error)) {
+      for (const [type, code] of Object.entries(value.error)) {
+        const signature = { type, code: String(code) };
+        const key = `${signature.type}:${signature.code}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        signatures.push(signature);
+      }
+    }
+
+    const sdkSignature = extractSdkErrorSignature(value);
+    if (sdkSignature) {
+      const key = `${sdkSignature.type}:${sdkSignature.code}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        signatures.push(sdkSignature);
+      }
+    }
+
+    for (const inner of Object.values(value)) {
+      visit(inner);
+    }
+  };
+
+  visit(diagnosticEvents);
 
   return signatures.sort((a, b) =>
     `${a.type}:${a.code}`.localeCompare(`${b.type}:${b.code}`),
   );
+}
+
+export function extractOperationType(operation: unknown): string | undefined {
+  const body = (operation as any)?.body ?? (operation as any)?._attributes?.body;
+  if (!isRecord(body)) return undefined;
+
+  if (!("_switch" in body) || !isRecord(body._switch)) {
+    const keys = Object.keys(body);
+    return keys.length > 0 ? keys[0] : undefined;
+  }
+
+  if (typeof body._switch.name !== "string") return undefined;
+  return toSnakeCase(body._switch.name);
+}
+
+export function extractOperationTypes(envelope: unknown): string[] {
+  const types = new Set<string>();
+  for (const operation of extractEnvelopeOperations(envelope)) {
+    const type = extractOperationType(operation);
+    if (type) types.add(type);
+  }
+  return [...types];
+}
+
+export function extractSorobanOperationTypes(envelope: unknown): string[] {
+  return extractOperationTypes(envelope).filter((type) =>
+    SOROBAN_OPERATION_TYPES.has(type)
+  );
+}
+
+function extractSdkInvokeCall(operation: unknown): TransactionInvokeCall | null {
+  const body = (operation as any)?._attributes?.body;
+  if (!isRecord(body) || body._arm !== "invokeHostFunctionOp") {
+    return null;
+  }
+
+  const invoke = getRecordPath(body, ["_value", "_attributes"]);
+  const hostFunction = getRecordPath(invoke, ["hostFunction"]);
+  if (!isRecord(hostFunction) || hostFunction._arm !== "invokeContract") {
+    return null;
+  }
+
+  const invokeContract = getRecordPath(hostFunction, ["_value", "_attributes"]);
+  if (!isRecord(invokeContract)) return null;
+
+  const auth = Array.isArray((invoke as any)?.auth) ? (invoke as any).auth : undefined;
+  const contractId = decodeContractIdValue(invokeContract.contractAddress);
+  const functionName = decodeFunctionNameValue(invokeContract.functionName);
+  const args = Array.isArray(invokeContract.args) ? invokeContract.args : undefined;
+
+  return {
+    contractId: contractId ?? invokeContract.contractAddress,
+    functionName: functionName ?? invokeContract.functionName,
+    args,
+    argCount: args?.length ?? 0,
+    auth,
+    authCount: auth?.length ?? 0,
+  };
+}
+
+function extractFlattenedInvokeCall(operation: unknown): TransactionInvokeCall | null {
+  const invoke = (operation as any)?.body?.invoke_host_function;
+  const invokeContract = invoke?.host_function?.invoke_contract;
+  if (!invokeContract) return null;
+
+  return {
+    contractId: invokeContract.contract_address,
+    functionName: invokeContract.function_name,
+    args: invokeContract.args,
+    argCount: Array.isArray(invokeContract.args)
+      ? invokeContract.args.length
+      : 0,
+    auth: invoke?.auth,
+    authCount: Array.isArray(invoke?.auth) ? invoke.auth.length : 0,
+  };
 }
 
 export function extractFunctionName(envelopeJson: unknown): string {
@@ -106,38 +328,33 @@ export function extractFunctionName(envelopeJson: unknown): string {
 }
 
 export function extractEnvelopeOperations(envelope: unknown): unknown[] {
-  if ((envelope as any)?.tx?.tx?.operations) {
-    return (envelope as any).tx.tx.operations;
-  }
-  if ((envelope as any)?.tx_fee_bump?.tx?.inner_tx?.tx?.tx?.operations) {
-    return (envelope as any).tx_fee_bump.tx.inner_tx.tx.tx.operations;
-  }
-  return [];
-}
+  const candidates = [
+    getRecordPath(envelope, ["tx", "tx", "operations"]),
+    getRecordPath(envelope, ["tx_fee_bump", "tx", "inner_tx", "tx", "tx", "operations"]),
+    getRecordPath(envelope, ["_value", "_attributes", "tx", "_attributes", "operations"]),
+    getRecordPath(
+      envelope,
+      ["_value", "_attributes", "tx", "_attributes", "innerTx", "_attributes", "tx", "_attributes", "operations"],
+    ),
+    getRecordPath(
+      envelope,
+      ["_value", "_attributes", "tx", "_attributes", "innerTx", "_attributes", "operations"],
+    ),
+  ];
 
-export function extractProcessingOperations(processing: unknown): unknown[] {
-  const operations = (processing as any)?.tx_apply_processing?.v4?.operations;
-  return Array.isArray(operations) ? operations : [];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+
+  return [];
 }
 
 export function extractInvokeCalls(envelope: unknown): TransactionInvokeCall[] {
   const calls: TransactionInvokeCall[] = [];
 
   for (const operation of extractEnvelopeOperations(envelope)) {
-    const invoke = (operation as any)?.body?.invoke_host_function;
-    const invokeContract = invoke?.host_function?.invoke_contract;
-    if (!invokeContract) continue;
-
-    calls.push({
-      contractId: invokeContract.contract_address,
-      functionName: invokeContract.function_name,
-      args: invokeContract.args,
-      argCount: Array.isArray(invokeContract.args)
-        ? invokeContract.args.length
-        : 0,
-      auth: invoke?.auth,
-      authCount: Array.isArray(invoke?.auth) ? invoke.auth.length : 0,
-    });
+    const call = extractFlattenedInvokeCall(operation) ?? extractSdkInvokeCall(operation);
+    if (call) calls.push(call);
   }
 
   return calls;
@@ -193,6 +410,10 @@ export function extractResourceLimits(
   });
 
   return resources;
+}
+export function extractProcessingOperations(processing: unknown): unknown[] {
+  const operations = (processing as any)?.tx_apply_processing?.v4?.operations;
+  return Array.isArray(operations) ? operations : [];
 }
 
 export function extractResultDetails(processing: unknown): unknown {
@@ -256,13 +477,6 @@ function findLedgerEntryType(value: unknown): string | undefined {
   return ledgerEntryType;
 }
 
-function normalizeOperationType(operation: unknown): string | undefined {
-  const body = (operation as any)?.body;
-  if (!body || typeof body !== "object") return undefined;
-  const keys = Object.keys(body);
-  return keys.length > 0 ? keys[0] : undefined;
-}
-
 function buildOperationContexts(
   envelope: unknown,
   processing: unknown,
@@ -289,7 +503,7 @@ function buildOperationContexts(
 
     contexts.push({
       index,
-      operationType: normalizeOperationType(envelopeOperation),
+      operationType: extractOperationType(envelopeOperation),
       sourceAccount:
         typeof (envelopeOperation as any)?.source_account === "string"
           ? (envelopeOperation as any).source_account

@@ -2,6 +2,7 @@ import { xdr } from "@stellar/stellar-sdk";
 import {
   buildDecodedTransactionContext,
   collectContractIdsFromValue,
+  extractOperationTypes,
 } from "./transaction.js";
 import { normalizeXdrBase64 } from "./input.js";
 import type {
@@ -9,6 +10,7 @@ import type {
   ErrorReadout,
   ErrorSignature,
   FailedTransaction,
+  TransactionRpcContext,
 } from "./types.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -47,15 +49,40 @@ function xdrToJson<T>(value: T): unknown {
   return JSON.parse(JSON.stringify(value));
 }
 
-function parseEnvelopeXdr(xdrBase64: string): unknown {
-  return xdrToJson(
-    xdr.TransactionEnvelope.fromXDR(normalizeXdrBase64(xdrBase64), "base64"),
+async function decodePreferredXdr(
+  xdrBase64: string,
+  knownType: string,
+  fallback: () => unknown,
+): Promise<unknown> {
+  try {
+    const { decodeXdrWithType } = await import("./xdr.js");
+    const decoded = decodeXdrWithType(xdrBase64, knownType);
+    if (decoded?.json) return decoded.json;
+  } catch {
+    // Fall back to SDK JSON when the richer decoder is unavailable.
+  }
+  return fallback();
+}
+
+async function parseEnvelopeXdr(xdrBase64: string): Promise<unknown> {
+  return await decodePreferredXdr(
+    normalizeXdrBase64(xdrBase64),
+    "TransactionEnvelope",
+    () =>
+      xdrToJson(
+        xdr.TransactionEnvelope.fromXDR(normalizeXdrBase64(xdrBase64), "base64"),
+      ),
   );
 }
 
-function parseResultXdr(xdrBase64: string): unknown {
-  return xdrToJson(
-    xdr.TransactionResult.fromXDR(normalizeXdrBase64(xdrBase64), "base64"),
+async function parseResultXdr(xdrBase64: string): Promise<unknown> {
+  return await decodePreferredXdr(
+    normalizeXdrBase64(xdrBase64),
+    "TransactionResult",
+    () =>
+      xdrToJson(
+        xdr.TransactionResult.fromXDR(normalizeXdrBase64(xdrBase64), "base64"),
+      ),
   );
 }
 
@@ -104,22 +131,25 @@ function extractRpcSendResultKind(resultJson: unknown): string | null {
   return switchName ? normalizeTxResultKind(switchName) : null;
 }
 
-function parseDiagnosticEvents(events: unknown): unknown[] {
+async function parseDiagnosticEvents(events: unknown): Promise<unknown[]> {
   if (!Array.isArray(events)) return [];
-  return events
-    .flatMap((item) => {
+  const decoded = await Promise.all(events.map(async (item) => {
       if (typeof item === "string" && item.length > 0) {
-        return [
-          xdrToJson(
-            xdr.DiagnosticEvent.fromXDR(normalizeXdrBase64(item), "base64"),
-          ),
-        ];
+        return decodePreferredXdr(
+          normalizeXdrBase64(item),
+          "DiagnosticEvent",
+          () =>
+            xdrToJson(
+              xdr.DiagnosticEvent.fromXDR(normalizeXdrBase64(item), "base64"),
+            ),
+        );
       }
       if (isRecord(item)) {
-        return [item];
+        return item;
       }
-      return [];
-    });
+      return null;
+    }));
+  return decoded.flatMap((item) => item === null ? [] : [item]);
 }
 
 function findMatchingKey(
@@ -146,20 +176,7 @@ function findMatchingKey(
 }
 
 function collectOperationTypes(envelopeJson: unknown): string[] {
-  const serialized = JSON.stringify(envelopeJson);
-  const types: string[] = [];
-
-  if (serialized.includes("invoke_host_function")) {
-    types.push("invoke_host_function");
-  }
-  if (serialized.includes("restore_footprint")) {
-    types.push("restore_footprint");
-  }
-  if (serialized.includes("extend_footprint_ttl")) {
-    types.push("extend_footprint_ttl");
-  }
-
-  return types;
+  return extractOperationTypes(envelopeJson);
 }
 
 function fallbackErrorSignatures(
@@ -177,6 +194,10 @@ function fallbackErrorSignatures(
     });
   }
   return signatures;
+}
+
+function extractSimulationErrorHeadline(value: string): string {
+  return value.split(/\n\s*\n|\n/)[0]?.trim() || value.trim();
 }
 
 async function createSyntheticHash(input: string): Promise<string> {
@@ -262,6 +283,33 @@ function buildSourcePayload(
   });
 }
 
+function parseRpcContext(
+  value: Record<string, unknown>,
+): TransactionRpcContext | undefined {
+  const network = value.network;
+  const rpcContext: TransactionRpcContext = {
+    network:
+      network === "mainnet" ||
+        network === "testnet" ||
+        network === "futurenet" ||
+        network === "custom"
+        ? network
+        : undefined,
+    rpcEndpoint: typeof value.rpcEndpoint === "string" ? value.rpcEndpoint : undefined,
+    archiveRpcEndpoint:
+      typeof value.archiveRpcEndpoint === "string" ? value.archiveRpcEndpoint : undefined,
+    authMode:
+      value.rpcAuthMode === "header" || value.rpcAuthMode === "path"
+        ? value.rpcAuthMode
+        : undefined,
+  };
+
+  return rpcContext.network || rpcContext.rpcEndpoint || rpcContext.archiveRpcEndpoint ||
+      rpcContext.authMode
+    ? rpcContext
+    : undefined;
+}
+
 export function parseDirectErrorSubmission(
   raw: unknown,
 ): DirectErrorSubmission {
@@ -297,6 +345,8 @@ export function parseDirectErrorSubmission(
     sourceLabel: typeof raw.sourceLabel === "string"
       ? raw.sourceLabel
       : undefined,
+    forceReanalyze: raw.forceReanalyze === true || raw.force === true,
+    ...parseRpcContext(raw),
   };
 }
 
@@ -306,7 +356,8 @@ export async function buildFailedTransactionFromDirectError(
   const observedAt = submission.submittedAt
     ? normalizeTimestamp(submission.submittedAt, new Date().toISOString())
     : new Date().toISOString();
-  const envelopeJson = parseEnvelopeXdr(submission.transactionXdr);
+  const envelopeJson = await parseEnvelopeXdr(submission.transactionXdr);
+  const rpcContext = parseRpcContext(submission as unknown as Record<string, unknown>);
 
   if (submission.kind === "rpc_send") {
     const status = submission.response.status;
@@ -321,14 +372,14 @@ export async function buildFailedTransactionFromDirectError(
       ? submission.response.hash
       : `rpcsend-${await createSyntheticHash(JSON.stringify(submission))}`;
     const resultJson = typeof submission.response.errorResultXdr === "string"
-      ? parseResultXdr(submission.response.errorResultXdr)
+      ? await parseResultXdr(submission.response.errorResultXdr)
       : isRecord(submission.response.errorResult)
       ? submission.response.errorResult
       : null;
     const resultKind = resultJson
       ? extractRpcSendResultKind(resultJson)
       : null;
-    const diagnosticEvents = parseDiagnosticEvents(
+    const diagnosticEvents = await parseDiagnosticEvents(
       submission.response.diagnosticEventsXdr ?? submission.response.diagnosticEvents,
     );
     const processingJson = buildProcessingJson(
@@ -410,6 +461,7 @@ export async function buildFailedTransactionFromDirectError(
         submission.response,
         hash,
       ),
+      rpcContext,
       sourcePayload: buildSourcePayload(submission, observedAt),
     };
   }
@@ -419,8 +471,10 @@ export async function buildFailedTransactionFromDirectError(
   }
 
   const sourceReference = `rpcsim-${await createSyntheticHash(JSON.stringify(submission))}`;
-  const diagnosticEvents = parseDiagnosticEvents(submission.response.events);
-  const resultKind = `simulate:${normalizeCode(submission.response.error)}`;
+  const diagnosticEvents = await parseDiagnosticEvents(submission.response.events);
+  const resultKind = `simulate:${normalizeCode(
+    extractSimulationErrorHeadline(submission.response.error),
+  )}`;
   const processingJson = buildProcessingJson(resultKind, diagnosticEvents, {
     error: submission.response.error,
     latestLedger:
@@ -491,6 +545,7 @@ export async function buildFailedTransactionFromDirectError(
       submission.response,
       sourceReference,
     ),
+    rpcContext,
     sourcePayload: buildSourcePayload(submission, observedAt),
   };
 }

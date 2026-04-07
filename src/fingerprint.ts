@@ -6,6 +6,24 @@ import {
 
 export { extractErrorSignatures, extractFunctionName };
 
+function fingerprintScope(tx: FailedTransaction): string {
+  if (tx.rpcContext?.network) {
+    return `network:${tx.rpcContext.network}`;
+  }
+
+  if (tx.rpcContext?.archiveRpcEndpoint || tx.rpcContext?.rpcEndpoint) {
+    return (
+      tx.rpcContext.archiveRpcEndpoint ||
+      tx.rpcContext.rpcEndpoint ||
+      ""
+    )
+      .trim()
+      .toLowerCase();
+  }
+
+  return "default";
+}
+
 /**
  * Build a deterministic fingerprint string from the error's structural identity.
  * SHA-256 hex hash of: contractIds | functionName | errorSignatures | resultKind
@@ -32,6 +50,7 @@ export async function buildFingerprint(
     : tx.contractIds;
 
   const parts = [
+    fingerprintScope(tx),
     fingerprintContracts.slice().sort().join(","),
     functionName,
     errorSignatures.map((s) => `${s.type}:${s.code}`).join(","),
@@ -79,9 +98,11 @@ export function buildErrorDescription(
   functionName: string,
   errorSignatures: ErrorSignature[],
   resultKind: string,
+  scope?: string,
 ): string {
   const parts = [
     "Stellar/Soroban transaction failure",
+    `Scope: ${scope || "default"}`,
     `Result: ${resultKind}`,
     `Contracts: ${contractIds.join(", ") || "none"}`,
     `Function: ${functionName}`,

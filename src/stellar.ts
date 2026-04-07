@@ -1,7 +1,20 @@
 import { xdr } from "@stellar/stellar-sdk";
-import type { Env, FailedTransaction, ErrorReadout, ScanResult } from "./types.js";
+import type {
+  Env,
+  FailedTransaction,
+  ErrorReadout,
+  ScanResult,
+  TransactionRpcContext,
+} from "./types.js";
 import { buildDecodedTransactionContext } from "./transaction.js";
-import { buildRpcUrl, getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
+import {
+  buildRpcUrl,
+  getRealtimeRpcEndpoint,
+  getRpcAuthMode,
+  resolveRpcConfig,
+  rpcRequest,
+  rpcRequestWithEnv,
+} from "./rpc.js";
 
 const SOROBAN_OPERATION_KEYS = new Set([
   "invoke_host_function",
@@ -13,6 +26,21 @@ const SUCCESS_KINDS = new Set(["tx_success", "tx_fee_bump_inner_success"]);
 
 function xdrToJson<T>(value: T): unknown {
   return JSON.parse(JSON.stringify(value));
+}
+
+async function decodePreferredXdr(
+  xdrBase64: string,
+  knownType: string,
+  fallback: () => unknown,
+): Promise<unknown> {
+  try {
+    const { decodeXdrWithType } = await import("./xdr.js");
+    const decoded = decodeXdrWithType(xdrBase64, knownType);
+    if (decoded?.json) return decoded.json;
+  } catch {
+    // Fall back to SDK JSON when the richer decoder is unavailable.
+  }
+  return fallback();
 }
 
 // --- RPC Client ---
@@ -50,7 +78,25 @@ async function fetchLedgerRange(
   startLedger: number,
   limit: number,
   cursor?: string,
+  rpcContext?: TransactionRpcContext,
 ): Promise<any> {
+  if (rpcContext?.network === "testnet") {
+    return rpcRequestWithEnv(env, {
+      method: "getLedgers",
+      params: cursor
+        ? {
+          pagination: { cursor, limit },
+          xdrFormat: "json",
+        }
+        : {
+          startLedger,
+          pagination: { limit },
+          xdrFormat: "json",
+        },
+      useArchiveEndpoint: true,
+    }, rpcContext);
+  }
+
   const authMode = getRpcAuthMode(env);
   const payload = buildLedgersPayload(startLedger, limit, cursor);
   const response = await fetch(
@@ -436,16 +482,21 @@ function extractFailedSorobanTransactions(
   return failed;
 }
 
-function parseDiagnosticEventsXdr(events: unknown): unknown[] {
+async function parseDiagnosticEventsXdr(events: unknown): Promise<unknown[]> {
   if (!Array.isArray(events)) return [];
-  return events.flatMap((item) => {
+  const decoded = await Promise.all(events.map(async (item) => {
     if (typeof item !== "string" || !item.length) return [];
     try {
-      return [xdrToJson(xdr.DiagnosticEvent.fromXDR(item, "base64"))];
+      return await decodePreferredXdr(
+        item,
+        "DiagnosticEvent",
+        () => xdrToJson(xdr.DiagnosticEvent.fromXDR(item, "base64")),
+      );
     } catch {
-      return [];
+      return null;
     }
-  });
+  }));
+  return decoded.flatMap((item) => item === null ? [] : [item]);
 }
 
 function normalizeTransactionMeta(meta: unknown, diagnosticEvents: unknown[]): unknown {
@@ -491,17 +542,15 @@ function normalizeTransactionMeta(meta: unknown, diagnosticEvents: unknown[]): u
 export async function getFailedTransactionByHash(
   env: Env,
   txHash: string,
+  rpcContext?: TransactionRpcContext,
 ): Promise<FailedTransaction | null> {
-  const result = await rpcRequest({
-    endpoint: getRealtimeRpcEndpoint(env),
-    token: env.STELLAR_ARCHIVE_RPC_TOKEN,
-    authMode: getRpcAuthMode(env),
+  const result = await rpcRequestWithEnv(env, {
     method: "getTransaction",
     params: {
       hash: txHash,
       xdrFormat: "base64",
     },
-  });
+  }, rpcContext);
 
   if (!result || result.status === "NOT_FOUND" || result.status !== "FAILED") {
     return null;
@@ -515,16 +564,24 @@ export async function getFailedTransactionByHash(
     return null;
   }
 
-  const envelopeJson = xdrToJson(
-    xdr.TransactionEnvelope.fromXDR(result.envelopeXdr, "base64"),
+  const envelopeJson = await decodePreferredXdr(
+    result.envelopeXdr,
+    "TransactionEnvelope",
+    () => xdrToJson(xdr.TransactionEnvelope.fromXDR(result.envelopeXdr, "base64")),
   );
-  const resultJson = xdrToJson(
-    xdr.TransactionResult.fromXDR(result.resultXdr, "base64"),
+  const resultJson = await decodePreferredXdr(
+    result.resultXdr,
+    "TransactionResult",
+    () => xdrToJson(xdr.TransactionResult.fromXDR(result.resultXdr, "base64")),
   ) as Record<string, unknown>;
   const metaJson = typeof result.resultMetaXdr === "string"
-    ? xdrToJson(xdr.TransactionMeta.fromXDR(result.resultMetaXdr, "base64"))
+    ? await decodePreferredXdr(
+      result.resultMetaXdr,
+      "TransactionMeta",
+      () => xdrToJson(xdr.TransactionMeta.fromXDR(result.resultMetaXdr, "base64")),
+    )
     : null;
-  const diagnosticEvents = parseDiagnosticEventsXdr(result.diagnosticEventsXdr);
+  const diagnosticEvents = await parseDiagnosticEventsXdr(result.diagnosticEventsXdr);
 
   const processing = {
     result: {
@@ -554,6 +611,7 @@ export async function scanForFailedTransactions(
   startLedger: number,
   maxLedgers: number,
   maxFailed?: number,
+  rpcContext?: TransactionRpcContext,
 ): Promise<ScanResult> {
   const allFailed: FailedTransaction[] = [];
   let cursor: string | undefined;
@@ -574,6 +632,7 @@ export async function scanForFailedTransactions(
       startLedger,
       Math.min(LEDGER_PAGE_SIZE, remainingLedgers),
       cursor,
+      rpcContext,
     );
 
     const ledgers = (result.ledgers ?? []).slice(0, remainingLedgers);
@@ -603,13 +662,13 @@ export async function scanForFailedTransactions(
   };
 }
 
-export async function getLatestLedger(env: Env): Promise<number> {
-  const result = await rpcRequest({
-    endpoint: getRealtimeRpcEndpoint(env),
-    token: env.STELLAR_ARCHIVE_RPC_TOKEN,
-    authMode: getRpcAuthMode(env),
+export async function getLatestLedger(
+  env: Env,
+  rpcContext?: TransactionRpcContext,
+): Promise<number> {
+  const result = await rpcRequestWithEnv(env, {
     method: "getLatestLedger",
-  });
+  }, rpcContext);
 
   const sequence = result?.sequence;
   return typeof sequence === "number" ? sequence : parseInt(sequence);

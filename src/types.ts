@@ -12,10 +12,29 @@ export interface Env {
   STELLAR_ARCHIVE_RPC_ENDPOINT: string;
   STELLAR_RPC_ENDPOINT?: string;
   STELLAR_RPC_AUTH_MODE?: "header" | "path";
+  STELLAR_TESTNET_ARCHIVE_RPC_ENDPOINT?: string;
+  STELLAR_TESTNET_RPC_ENDPOINT?: string;
+  STELLAR_TESTNET_RPC_TOKEN?: string;
+  STELLAR_TESTNET_RPC_AUTH_MODE?: "header" | "path";
   AI_SEARCH_INSTANCE: string;
   AI_SEARCH_MODEL: string;
   AI_ANALYSIS_MODEL: string;
+  AI_ANALYSIS_TIMEOUT_MS?: string;
+  AI_ANALYSIS_MAX_DURATION_MS?: string;
   JOB_RETENTION_HOURS?: string;
+}
+
+export type StellarRpcNetwork =
+  | "mainnet"
+  | "testnet"
+  | "futurenet"
+  | "custom";
+
+export interface TransactionRpcContext {
+  network?: StellarRpcNetwork;
+  rpcEndpoint?: string;
+  archiveRpcEndpoint?: string;
+  authMode?: "header" | "path";
 }
 
 export interface ErrorSignature {
@@ -97,6 +116,33 @@ export interface ContractErrorEnum {
   cases: Array<{ name: string; value: number; doc?: string }>;
 }
 
+export interface BuiltinSourceRef {
+  label: string;
+  url: string;
+}
+
+export interface BuiltinContractDescriptor {
+  kind: string;
+  name: string;
+  summary: string;
+  sourceRefs: BuiltinSourceRef[];
+  notes?: string[];
+  authSemantics?: string[];
+  failureModes?: string[];
+  detectionReason?: string;
+}
+
+export interface BuiltinTxInsight {
+  kind: string;
+  title: string;
+  summary: string;
+  trigger: string;
+  sourceRefs: BuiltinSourceRef[];
+  relatedFunctions?: string[];
+  relatedCodes?: string[];
+  debugHints?: string[];
+}
+
 export interface ContractStruct {
   name: string;
   fields: Array<{ name: string; type: string }>;
@@ -111,9 +157,13 @@ export interface ContractCustomSections {
 export interface ContractMetadata {
   contractId: string;
   wasmHash: string;
+  contractType?: "wasm" | "stellar_asset";
+  builtin?: BuiltinContractDescriptor;
   functions: ContractFunction[];
   errorEnums: ContractErrorEnum[];
   structs: ContractStruct[];
+  notes?: string[];
+  assetMetadata?: Record<string, string | number | boolean | string[]>;
   customSections?: ContractCustomSections;
   fetchedAt: string;
 }
@@ -136,6 +186,7 @@ export interface FailedTransaction {
   processingJson: unknown;
   decoded: DecodedTransactionContext;
   readout: ErrorReadout;
+  rpcContext?: TransactionRpcContext;
   sourcePayload?: unknown;
 }
 
@@ -204,6 +255,32 @@ export interface ExampleTransactionRecord {
   contracts: ContractMetadata[];
 }
 
+export interface PublicDecodedTransactionContext {
+  topLevelFunction: string;
+  errorSignatures: ErrorSignature[];
+  invokeCalls: Array<{
+    contractId?: unknown;
+    functionName?: unknown;
+    argCount?: number;
+    authCount?: number;
+  }>;
+  authEntryCount: number;
+  authEntryPreview: unknown[];
+  resourceLimits: TransactionResourceLimits | null;
+  transactionResult: unknown;
+  contractEvents: {
+    count: number;
+    preview: unknown[];
+  };
+  diagnosticEvents: {
+    count: number;
+    preview: unknown[];
+  };
+  processingOperationCount: number;
+  ledgerChangeCount: number;
+  touchedContractIds: string[];
+}
+
 export interface AnalysisResult {
   txHash: string;
   summary: string;
@@ -232,6 +309,11 @@ export interface DirectErrorSubmission {
   response: Record<string, unknown>;
   submittedAt?: string;
   sourceLabel?: string;
+  forceReanalyze?: boolean;
+  network?: StellarRpcNetwork;
+  rpcEndpoint?: string;
+  archiveRpcEndpoint?: string;
+  rpcAuthMode?: "header" | "path";
 }
 
 export type AsyncJobKind =
@@ -264,20 +346,68 @@ export interface AsyncJobProgress {
   message?: string;
 }
 
-export interface PublicFailedTransaction
-  extends Omit<FailedTransaction, "sourcePayload"> {
-  processingJson: unknown;
+export interface PublicFailedTransaction {
+  observationKind: ObservationKind;
+  txHash: string;
+  ledgerSequence: number;
+  ledgerCloseTime: string;
+  resultKind: string;
+  soroban: true;
+  primaryContractIds: string[];
+  contractIds: string[];
+  operationTypes: string[];
+  sorobanOperationTypes: string[];
+  readout: ErrorReadout;
+  rpcContext?: TransactionRpcContext;
+  decoded: PublicDecodedTransactionContext;
+}
+
+export interface PublicContractMetadata {
+  contractId: string;
+  wasmHash: string;
+  contractType?: "wasm" | "stellar_asset";
+  builtin?: BuiltinContractDescriptor;
+  notes?: string[];
+  assetMetadata?: Record<string, string | number | boolean | string[]>;
+  functionCount: number;
+  errorEnumCount: number;
+  structCount: number;
 }
 
 export interface PublicExampleTransactionRecord
-  extends Omit<ExampleTransactionRecord, "transaction"> {
+  extends Omit<ExampleTransactionRecord, "transaction" | "contracts"> {
   transaction: PublicFailedTransaction;
+  contracts: PublicContractMetadata[];
+}
+
+export interface PublicErrorEntry {
+  fingerprint: string;
+  observationKinds: ObservationKind[];
+  contractIds: string[];
+  functionName: string;
+  errorSignatures: ErrorSignature[];
+  resultKind: string;
+  sorobanOperationTypes: string[];
+  summary: string;
+  errorCategory: string;
+  likelyCause: string;
+  suggestedFix: string;
+  detailedAnalysis: string;
+  evidence: string[];
+  relatedCodes: string[];
+  debugSteps: string[];
+  confidence: "high" | "medium" | "low" | "failed";
+  modelId: string;
+  seenCount: number;
+  firstSeen: string;
+  lastSeen: string;
+  exampleTxHash: string;
 }
 
 export interface DirectErrorJobResult {
   duplicate: boolean;
   fingerprint: string;
-  entry: ErrorEntry;
+  entry: PublicErrorEntry;
   example: PublicExampleTransactionRecord | null;
 }
 
@@ -316,6 +446,7 @@ export interface DirectErrorWorkflowInput {
   sourceReference: string;
   stagedTransactionKey: string;
   txHash: string;
+  forceReanalyze?: boolean;
 }
 
 export type LedgerRangeJobMode = "batch" | "recurring";
