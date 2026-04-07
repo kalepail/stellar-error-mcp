@@ -945,7 +945,12 @@ function isMalformedJsonResponseError(message: string): boolean {
   return normalized.includes("unterminated string in json") ||
     normalized.includes("unexpected end of json input") ||
     normalized.includes("unexpected non-whitespace character after json") ||
-    normalized.includes("expected ',' or '}' after property value");
+    normalized.includes("expected ',' or '}' after property value") ||
+    normalized.includes("unexpected token") ||
+    normalized.includes("unexpected string in json") ||
+    normalized.includes("unexpected number in json") ||
+    normalized.includes("unexpected keyword in json") ||
+    normalized.includes("expected property name or '}'");
 }
 
 function isRetryableAiError(message: string): boolean {

@@ -33,7 +33,6 @@ const DEFAULT_TESTNET_RPC_ENDPOINTS = [
   "https://stellar-soroban-testnet-public.nodies.app",
   "https://soroban-rpc.testnet.stellar.gateway.fm",
   "https://soroban-testnet.stellar.org",
-  "https://stellar.liquify.com/api=41EEWAH79Y5OCGI7/testnet",
 ];
 
 function trimTrailingSlashes(value: string): string {
@@ -183,6 +182,24 @@ export function resolveRpcConfig(
       token: env.STELLAR_TESTNET_RPC_TOKEN?.trim() || undefined,
       authMode,
       scope: "network:testnet",
+    };
+  }
+
+  if (requestedNetwork === "futurenet" || requestedNetwork === "custom") {
+    const rpcEndpoint = context?.rpcEndpoint?.trim();
+    if (!rpcEndpoint) {
+      throw new Error(
+        `network '${requestedNetwork}' requires an explicit rpcEndpoint; refusing to fall back to mainnet defaults`,
+      );
+    }
+    const archiveRpcEndpoint = context?.archiveRpcEndpoint?.trim() || rpcEndpoint;
+    const endpointScope = sanitizeScopePart(archiveRpcEndpoint || rpcEndpoint);
+    return {
+      rpcEndpoint,
+      archiveRpcEndpoint,
+      token: env.STELLAR_ARCHIVE_RPC_TOKEN,
+      authMode,
+      scope: `network:${requestedNetwork}:endpoint:${endpointScope}`,
     };
   }
 

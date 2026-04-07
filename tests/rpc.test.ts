@@ -134,4 +134,37 @@ describe("rpc helpers", () => {
       "https://soroban-rpc.testnet.stellar.gateway.fm",
     );
   });
+
+  it("requires explicit endpoints for custom networks instead of falling back to mainnet", async () => {
+    const { resolveRpcConfig } = await import("../src/rpc.js");
+    const env = createTestEnv();
+
+    expect(() => resolveRpcConfig(env, { network: "custom" })).toThrow(
+      "network 'custom' requires an explicit rpcEndpoint",
+    );
+    expect(() => resolveRpcConfig(env, { network: "futurenet" })).toThrow(
+      "network 'futurenet' requires an explicit rpcEndpoint",
+    );
+  });
+
+  it("scopes custom and futurenet RPC caches by endpoint", async () => {
+    const { resolveRpcConfig } = await import("../src/rpc.js");
+    const env = createTestEnv();
+
+    expect(resolveRpcConfig(env, {
+      network: "custom",
+      rpcEndpoint: "https://custom-a.example.com/rpc",
+    }).scope).toBe("network:custom:endpoint:custom_a_example_com_rpc");
+
+    expect(resolveRpcConfig(env, {
+      network: "custom",
+      rpcEndpoint: "https://custom-b.example.com/rpc",
+    }).scope).toBe("network:custom:endpoint:custom_b_example_com_rpc");
+
+    expect(resolveRpcConfig(env, {
+      network: "futurenet",
+      rpcEndpoint: "https://future.example.com",
+      archiveRpcEndpoint: "https://archive.future.example.com",
+    }).scope).toBe("network:futurenet:endpoint:archive_future_example_com");
+  });
 });

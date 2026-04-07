@@ -663,6 +663,60 @@ describe("analysis prompt building", () => {
     expect(prompts[1].length).toBeLessThan(prompts[0].length);
   });
 
+  it("rebuilds the prompt with a tighter profile on common JSON.parse syntax errors", async () => {
+    const env = createTestEnv();
+    const prompts: string[] = [];
+    const huge = "x".repeat(70000);
+    env.AI = {
+      run: vi.fn(async (_model: string, params: any) => {
+        const prompt = params.messages[1].content as string;
+        prompts.push(prompt);
+        if (prompts.length === 1) {
+          return "<html>502 upstream</html>";
+        }
+        return JSON.stringify({
+          summary: "summary",
+          errorCategory: "auth:invalid_action",
+          likelyCause: "cause",
+          suggestedFix: "fix",
+          detailedAnalysis: "details",
+          evidence: ["evidence"],
+          relatedCodes: ["Error(Auth, InvalidAction)"],
+          debugSteps: ["step"],
+          confidence: "high",
+        });
+      }),
+    } as unknown as Ai;
+
+    const result = await analyzeFailedTransaction(
+      env,
+      createFailedTx({
+        envelopeJson: { envelope: huge },
+        processingJson: { processing: huge },
+        decoded: {
+          ...createFailedTx().decoded,
+          decodedEnvelope: { decodedEnvelope: huge },
+          decodedProcessing: { decodedProcessing: huge },
+          diagnosticEvents: Array.from({ length: 250 }, (_, index) => ({
+            type: "diagnostic",
+            index,
+            message: huge,
+          })),
+          contractEvents: Array.from({ length: 100 }, (_, index) => ({
+            type: "contract",
+            index,
+            payload: huge,
+          })),
+        },
+      }),
+      createContractMetadata(),
+    );
+
+    expect(result.errorCategory).toBe("auth:invalid_action");
+    expect(prompts.length).toBeGreaterThan(1);
+    expect(prompts[1].length).toBeLessThan(prompts[0].length);
+  });
+
   it("fails explicitly when Kimi exhausts the retry window", async () => {
     const env = createTestEnv();
     env.AI_ANALYSIS_MAX_DURATION_MS = "1500";
