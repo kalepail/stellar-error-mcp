@@ -67,4 +67,18 @@ describe("fingerprint fallback signatures", () => {
     expect(noisy.errorSignatures).toEqual(compact.errorSignatures);
     expect(noisy.fingerprint).toBe(compact.fingerprint);
   });
+
+  it("scopes identical failures differently on testnet and mainnet", async () => {
+    const testnet = await buildFingerprint({
+      ...createFailedTransaction("HostError: Error(Auth, InvalidAction)"),
+      rpcContext: { network: "testnet" },
+    });
+    const mainnet = await buildFingerprint({
+      ...createFailedTransaction("HostError: Error(Auth, InvalidAction)"),
+      rpcContext: { network: "mainnet" },
+    });
+
+    expect(testnet.errorSignatures).toEqual(mainnet.errorSignatures);
+    expect(testnet.fingerprint).not.toBe(mainnet.fingerprint);
+  });
 });

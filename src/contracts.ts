@@ -1,14 +1,20 @@
 import { xdr, Address, contract } from "@stellar/stellar-sdk";
 import type {
+  BuiltinTxInsight,
   ContractCustomSections,
   ContractErrorEnum,
   ContractFunction,
   ContractMetadata,
   ContractStruct,
   Env,
+  TransactionRpcContext,
 } from "./types.js";
 import { decodeXdrStream } from "./xdr.js";
-import { getRealtimeRpcEndpoint, getRpcAuthMode, rpcRequest } from "./rpc.js";
+import { resolveRpcConfig, rpcRequestWithEnv } from "./rpc.js";
+import {
+  buildBuiltinStellarAssetMetadata,
+  renderBuiltinSourceRefs,
+} from "./builtin-contracts.js";
 
 const { Spec } = contract;
 
@@ -32,16 +38,28 @@ const CONTRACT_SECTION_TYPES = {
   contractenvmetav0: "ScEnvMetaEntry",
 } as const;
 
+function getContractCacheKey(contractId: string, scope: string): string {
+  return `${scope}|${contractId}`;
+}
+
+function getContractStorageKey(contractId: string, scope: string): string {
+  const safeScope = scope.replace(/[^a-zA-Z0-9:_-]+/g, "_");
+  return `contracts/${safeScope}/${contractId}.json`;
+}
+
 export async function getCachedContract(
   env: Env,
   contractId: string,
+  rpcContext?: TransactionRpcContext,
 ): Promise<
   | { hit: true; value: ContractMetadata | null }
   | { hit: false }
 > {
+  const { scope } = resolveRpcConfig(env, rpcContext);
+  const cacheKeyString = getContractCacheKey(contractId, scope);
   // Tier 1: In-memory (free, same invocation)
-  if (memoryCache.has(contractId)) {
-    const cached = memoryCache.get(contractId)!;
+  if (memoryCache.has(cacheKeyString)) {
+    const cached = memoryCache.get(cacheKeyString)!;
     if (cached === NEGATIVE_CACHE) {
       return { hit: true, value: null };
     }
@@ -52,7 +70,7 @@ export async function getCachedContract(
   }
 
   // Tier 2: Cache API (free, same datacenter, persists across invocations)
-  const cacheKey = new Request(`https://cache.internal/contracts/${contractId}`);
+  const cacheKey = new Request(`https://cache.internal/contracts/${encodeURIComponent(scope)}/${contractId}`);
   try {
     const cache = caches.default;
     const cached = await cache.match(cacheKey);
@@ -61,7 +79,7 @@ export async function getCachedContract(
       if (meta.fetchedAt) {
         const age = Date.now() - new Date(meta.fetchedAt).getTime();
         if (age <= CACHE_MAX_AGE_MS) {
-          memoryCache.set(contractId, meta);
+          memoryCache.set(cacheKeyString, meta);
           return { hit: true, value: meta };
         }
       }
@@ -71,7 +89,7 @@ export async function getCachedContract(
   }
 
   // Tier 3: R2 (persistent, global)
-  const obj = await env.ERRORS_BUCKET.get(`contracts/${contractId}.json`);
+  const obj = await env.ERRORS_BUCKET.get(getContractStorageKey(contractId, scope));
   if (!obj) {
     return { hit: false };
   }
@@ -86,14 +104,15 @@ export async function getCachedContract(
         level: "info",
         event: "contracts.cache_expired",
         contractId,
+        scope,
         ageDays: Math.floor(age / 86400000),
       }));
-      memoryCache.set(contractId, STALE_CACHE);
+      memoryCache.set(cacheKeyString, STALE_CACHE);
       return { hit: false };
     }
   }
 
-  memoryCache.set(contractId, meta);
+  memoryCache.set(cacheKeyString, meta);
 
   // Backfill Cache API for future invocations
   try {
@@ -113,17 +132,22 @@ export async function getCachedContract(
   return { hit: true, value: meta };
 }
 
-async function cacheContract(env: Env, meta: ContractMetadata): Promise<void> {
+async function cacheContract(
+  env: Env,
+  meta: ContractMetadata,
+  scope: string,
+): Promise<void> {
   const json = JSON.stringify(meta, null, 2);
 
   // R2: persistent global cache
   await env.ERRORS_BUCKET.put(
-    `contracts/${meta.contractId}.json`,
+    getContractStorageKey(meta.contractId, scope),
     json,
     {
       httpMetadata: { contentType: "application/json" },
       customMetadata: {
         contractId: meta.contractId,
+        scope,
         wasmHash: meta.wasmHash,
         functionCount: String(meta.functions.length),
         errorEnumCount: String(meta.errorEnums.length),
@@ -134,7 +158,7 @@ async function cacheContract(env: Env, meta: ContractMetadata): Promise<void> {
   // Cache API: datacenter-local, free
   try {
     const cache = caches.default;
-    const cacheKey = new Request(`https://cache.internal/contracts/${meta.contractId}`);
+    const cacheKey = new Request(`https://cache.internal/contracts/${encodeURIComponent(scope)}/${meta.contractId}`);
     const cacheResponse = new Response(json, {
       headers: {
         "Content-Type": "application/json",
@@ -152,14 +176,12 @@ async function cacheContract(env: Env, meta: ContractMetadata): Promise<void> {
 async function rpcGetLedgerEntries(
   env: Env,
   keys: xdr.LedgerKey[],
+  rpcContext?: TransactionRpcContext,
 ): Promise<any[]> {
-  const result = await rpcRequest({
-    endpoint: getRealtimeRpcEndpoint(env),
-    token: env.STELLAR_ARCHIVE_RPC_TOKEN,
-    authMode: getRpcAuthMode(env),
+  const result = await rpcRequestWithEnv(env, {
     method: "getLedgerEntries",
     params: { keys: keys.map((k) => k.toXDR("base64")) },
-  });
+  }, rpcContext);
   return result?.entries ?? [];
 }
 
@@ -168,9 +190,11 @@ async function rpcGetLedgerEntries(
 export async function fetchContractMetadata(
   env: Env,
   contractId: string,
+  rpcContext?: TransactionRpcContext,
 ): Promise<ContractMetadata | null> {
-  const cached = await getCachedContract(env, contractId);
+  const cached = await getCachedContract(env, contractId, rpcContext);
   if (cached.hit) return cached.value;
+  const { scope } = resolveRpcConfig(env, rpcContext);
 
   try {
     // Step 1: Fetch contract instance to get WASM hash
@@ -182,14 +206,15 @@ export async function fetchContractMetadata(
       }),
     );
 
-    const instanceEntries = await rpcGetLedgerEntries(env, [instanceKey]);
+    const instanceEntries = await rpcGetLedgerEntries(env, [instanceKey], rpcContext);
     if (instanceEntries.length === 0) {
       console.log(JSON.stringify({
         level: "info",
         event: "contracts.not_found",
         contractId,
+        scope,
       }));
-      memoryCache.set(contractId, NEGATIVE_CACHE);
+      memoryCache.set(getContractCacheKey(contractId, scope), NEGATIVE_CACHE);
       return null;
     }
 
@@ -199,7 +224,35 @@ export async function fetchContractMetadata(
       "base64",
     );
     const instance = ledgerEntry.contractData().val().instance();
-    const wasmHash = instance.executable().wasmHash();
+    const executable = instance.executable();
+    const executableSwitch = executable.switch().name;
+
+    if (executableSwitch === "contractExecutableStellarAsset") {
+      const meta = buildStellarAssetContractMetadata(contractId, instance);
+      await cacheContract(env, meta, scope);
+      memoryCache.set(getContractCacheKey(contractId, scope), meta);
+      console.log(JSON.stringify({
+        level: "info",
+        event: "contracts.fetched_stellar_asset",
+        contractId,
+        scope,
+      }));
+      return meta;
+    }
+
+    if (executableSwitch !== "contractExecutableWasm") {
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "contracts.unsupported_executable",
+        contractId,
+        scope,
+        executableType: executableSwitch,
+      }));
+      memoryCache.set(getContractCacheKey(contractId, scope), NEGATIVE_CACHE);
+      return null;
+    }
+
+    const wasmHash = executable.wasmHash();
     const wasmHashHex = wasmHash.toString("hex");
 
     // Step 2: Fetch contract code (WASM)
@@ -207,14 +260,15 @@ export async function fetchContractMetadata(
       new xdr.LedgerKeyContractCode({ hash: wasmHash }),
     );
 
-    const codeEntries = await rpcGetLedgerEntries(env, [codeKey]);
+    const codeEntries = await rpcGetLedgerEntries(env, [codeKey], rpcContext);
     if (codeEntries.length === 0) {
       console.log(JSON.stringify({
         level: "info",
         event: "contracts.code_missing",
         contractId,
+        scope,
       }));
-      memoryCache.set(contractId, NEGATIVE_CACHE);
+      memoryCache.set(getContractCacheKey(contractId, scope), NEGATIVE_CACHE);
       return null;
     }
 
@@ -232,54 +286,73 @@ export async function fetchContractMetadata(
         level: "info",
         event: "contracts.spec_missing",
         contractId,
+        scope,
       }));
-      memoryCache.set(contractId, NEGATIVE_CACHE);
+      memoryCache.set(getContractCacheKey(contractId, scope), NEGATIVE_CACHE);
       return null;
     }
 
     const spec = new Spec(specSection as any);
 
     // Extract functions (including doc comments from /// in Rust source)
-    const functions: ContractFunction[] = spec.funcs().map((fn: any) => {
-      const entry: ContractFunction = {
-        name: fn.name().toString(),
-        inputs: fn.inputs().map((inp: any) => ({
-          name: inp.name().toString(),
-          type: describeSpecType(inp.type()),
-        })),
-        outputs: fn.outputs().map((out: any) => describeSpecType(out)),
-      };
+    const functions: ContractFunction[] = [];
+    for (const fn of spec.funcs()) {
       try {
-        const doc = fn.doc?.()?.toString?.();
-        if (doc) entry.doc = doc;
-      } catch {
-        // doc() may not exist on older SDK versions
+        const entry: ContractFunction = {
+          name: fn.name().toString(),
+          inputs: fn.inputs().map((inp: any) => ({
+            name: inp.name().toString(),
+            type: describeSpecType(inp.type()),
+          })),
+          outputs: fn.outputs().map((out: any) => describeSpecType(out)),
+        };
+        try {
+          const doc = fn.doc?.()?.toString?.();
+          if (doc) entry.doc = doc;
+        } catch {
+          // doc() may not exist on older SDK versions
+        }
+        functions.push(entry);
+      } catch (error) {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "contracts.function_skipped",
+          contractId,
+          scope,
+          error: error instanceof Error ? error.message : String(error),
+        }));
       }
-      return entry;
-    });
+    }
 
     // Extract error enums (including per-case doc comments)
     const errorCases = spec.errorCases();
+    const parsedErrorCases: ContractErrorEnum["cases"] = [];
+    for (const c of errorCases) {
+      try {
+        const entry: ContractErrorEnum["cases"][number] = {
+          name: c.name().toString(),
+          value: c.value(),
+        };
+        try {
+          const doc = c.doc?.()?.toString?.();
+          if (doc) entry.doc = doc;
+        } catch {
+          // doc() may not exist
+        }
+        parsedErrorCases.push(entry);
+      } catch (error) {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "contracts.error_case_skipped",
+          contractId,
+          scope,
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      }
+    }
     const errorEnums: ContractErrorEnum[] =
-      errorCases.length > 0
-        ? [
-            {
-              name: "Error",
-              cases: errorCases.map((c: any) => {
-                const entry: ContractErrorEnum["cases"][number] = {
-                  name: c.name().toString(),
-                  value: c.value(),
-                };
-                try {
-                  const doc = c.doc?.()?.toString?.();
-                  if (doc) entry.doc = doc;
-                } catch {
-                  // doc() may not exist
-                }
-                return entry;
-              }),
-            },
-          ]
+      parsedErrorCases.length > 0
+        ? [{ name: "Error", cases: parsedErrorCases }]
         : [];
 
     // Extract structs via jsonSchema
@@ -309,6 +382,7 @@ export async function fetchContractMetadata(
     const meta: ContractMetadata = {
       contractId,
       wasmHash: wasmHashHex,
+      contractType: "wasm",
       functions,
       errorEnums,
       structs,
@@ -316,13 +390,14 @@ export async function fetchContractMetadata(
       fetchedAt: new Date().toISOString(),
     };
 
-    await cacheContract(env, meta);
-    memoryCache.set(contractId, meta);
+    await cacheContract(env, meta, scope);
+    memoryCache.set(getContractCacheKey(contractId, scope), meta);
 
     console.log(JSON.stringify({
       level: "info",
       event: "contracts.fetched",
       contractId,
+      scope,
       functionCount: functions.length,
       errorCodeCount: errorEnums.flatMap((e) => e.cases).length,
       structCount: structs.length,
@@ -335,10 +410,11 @@ export async function fetchContractMetadata(
       level: "error",
       event: "contracts.fetch_failed",
       contractId,
+      scope,
       error: msg,
     }));
     // Cache the failure too so we don't retry within the same cycle
-    memoryCache.set(contractId, NEGATIVE_CACHE);
+    memoryCache.set(getContractCacheKey(contractId, scope), NEGATIVE_CACHE);
     return null;
   }
 }
@@ -355,6 +431,7 @@ export function resetContractCacheForTests(): void {
 export async function fetchContractsForError(
   env: Env,
   contractIds: string[],
+  rpcContext?: TransactionRpcContext,
 ): Promise<Map<string, ContractMetadata>> {
   const results = new Map<string, ContractMetadata>();
   const unique = [...new Set(contractIds)];
@@ -362,7 +439,7 @@ export async function fetchContractsForError(
   // Fetch all contracts in parallel — each one has its own caching layers
   const settled = await Promise.allSettled(
     unique.map(async (id) => {
-      const meta = await fetchContractMetadata(env, id);
+      const meta = await fetchContractMetadata(env, id, rpcContext);
       return { id, meta };
     }),
   );
@@ -467,6 +544,152 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function decodeScValBasic(value: any): unknown {
+  try {
+    const switchName = value?.switch?.().name;
+    switch (switchName) {
+      case "scvU32":
+        return value.u32?.();
+      case "scvI32":
+        return value.i32?.();
+      case "scvU64":
+        return value.u64?.()?.toString?.();
+      case "scvI64":
+        return value.i64?.()?.toString?.();
+      case "scvBool":
+        return value.b?.();
+      case "scvBytes": {
+        const inner = value.bytes?.();
+        return inner ? Buffer.from(inner).toString("hex") : undefined;
+      }
+      case "scvString": {
+        const inner = value.str?.();
+        return typeof inner?.toString === "function" ? inner.toString() : undefined;
+      }
+      case "scvSymbol": {
+        const inner = value.sym?.();
+        return typeof inner?.toString === "function" ? inner.toString() : undefined;
+      }
+      case "scvAddress": {
+        const inner = value.address?.();
+        return inner ? Address.fromScAddress(inner).toString() : undefined;
+      }
+      case "scvVec": {
+        const inner = value.vec?.();
+        return Array.isArray(inner) ? inner.map((item: any) => decodeScValBasic(item)) : [];
+      }
+      case "scvMap": {
+        const inner = value.map?.();
+        if (!Array.isArray(inner)) return {};
+        return Object.fromEntries(
+          inner
+            .map((entry: any) => [decodeScValBasic(entry.key?.()), decodeScValBasic(entry.val?.())])
+            .filter(([key]) => typeof key === "string"),
+        );
+      }
+      default:
+        return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function renderMetadataValue(value: unknown): string | number | boolean | string[] | undefined {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const rendered = value.map((item) => {
+      if (
+        typeof item === "string" ||
+        typeof item === "number" ||
+        typeof item === "boolean"
+      ) {
+        return String(item);
+      }
+      return item == null ? "" : JSON.stringify(item);
+    }).filter(Boolean);
+    return rendered.length > 0 ? rendered : undefined;
+  }
+
+  if (value && typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  return undefined;
+}
+
+function extractStellarAssetMetadata(instance: any): Record<string, string | number | boolean | string[]> {
+  const metadata: Record<string, string | number | boolean | string[]> = {};
+  const storage = instance?.storage?.();
+  if (!Array.isArray(storage)) return metadata;
+
+  for (const entry of storage) {
+    const key = decodeScValBasic(entry?.key?.());
+    const val = decodeScValBasic(entry?.val?.());
+
+    if (key === "METADATA" && val && typeof val === "object" && !Array.isArray(val)) {
+      for (const [metaKey, metaValue] of Object.entries(val as Record<string, unknown>)) {
+        const rendered = renderMetadataValue(metaValue);
+        if (rendered !== undefined) {
+          metadata[metaKey] = rendered;
+        }
+      }
+      continue;
+    }
+
+    if (Array.isArray(key) && key.length > 0 && key.every((item) => typeof item === "string")) {
+      const rendered = renderMetadataValue(val);
+      if (rendered !== undefined) {
+        metadata[key.join(".")] = rendered;
+      }
+    }
+  }
+
+  return metadata;
+}
+
+function buildStellarAssetContractMetadata(
+  contractId: string,
+  instance: any,
+): ContractMetadata {
+  const assetMetadata = extractStellarAssetMetadata(instance);
+  const builtin = buildBuiltinStellarAssetMetadata(
+    "Detected from contractExecutableStellarAsset on-ledger executable type.",
+  );
+  const notes = [
+    ...(builtin.notes ?? []),
+    "Built-in Stellar Asset Contract executable",
+  ];
+
+  if (assetMetadata.AssetInfo) {
+    notes.push(`AssetInfo: ${Array.isArray(assetMetadata.AssetInfo) ? assetMetadata.AssetInfo.join(", ") : assetMetadata.AssetInfo}`);
+  }
+
+  return {
+    contractId,
+    wasmHash: "stellar_asset",
+    contractType: "stellar_asset",
+    builtin: builtin.builtin,
+    functions: builtin.functions,
+    errorEnums: builtin.errorEnums,
+    structs: [],
+    notes,
+    assetMetadata,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
 // --- Spec Type Description ---
 
 function describeSpecType(t: any): string {
@@ -541,14 +764,61 @@ function describeSpecType(t: any): string {
 
 export function buildContractContext(
   contracts: Map<string, ContractMetadata>,
+  builtinInsights: BuiltinTxInsight[] = [],
 ): string {
-  if (contracts.size === 0) return "";
+  if (contracts.size === 0 && builtinInsights.length === 0) return "";
 
   const parts: string[] = ["\nContract Specifications:"];
 
   for (const [id, meta] of contracts) {
     parts.push(`\nContract: ${id}`);
+    if (meta.contractType) {
+      parts.push(`  Contract Type: ${meta.contractType}`);
+    }
+    if (meta.builtin) {
+      parts.push(`  Built-in: ${meta.builtin.name} (${meta.builtin.kind})`);
+      parts.push(`  Built-in Summary: ${normalizeContextDoc(meta.builtin.summary)}`);
+      if (meta.builtin.detectionReason) {
+        parts.push(`  Built-in Detection: ${normalizeContextDoc(meta.builtin.detectionReason)}`);
+      }
+      const sourceRefs = renderBuiltinSourceRefs(meta.builtin.sourceRefs);
+      if (sourceRefs.length > 0) {
+        parts.push("  Built-in Sources:");
+        for (const sourceRef of sourceRefs) {
+          parts.push(`    - ${sourceRef}`);
+        }
+      }
+      if (meta.builtin.authSemantics?.length) {
+        parts.push("  Built-in Auth Semantics:");
+        for (const line of meta.builtin.authSemantics) {
+          parts.push(`    - ${normalizeContextDoc(line)}`);
+        }
+      }
+      if (meta.builtin.failureModes?.length) {
+        parts.push("  Built-in Failure Modes:");
+        for (const line of meta.builtin.failureModes) {
+          parts.push(`    - ${normalizeContextDoc(line)}`);
+        }
+      }
+    }
     parts.push(`  WASM Hash: ${meta.wasmHash}`);
+
+    if (meta.notes?.length) {
+      parts.push("  Notes:");
+      for (const note of meta.notes) {
+        parts.push(`    - ${normalizeContextDoc(note)}`);
+      }
+    }
+
+    if (meta.assetMetadata && Object.keys(meta.assetMetadata).length > 0) {
+      parts.push("  Asset Metadata:");
+      for (const [key, value] of Object.entries(meta.assetMetadata)) {
+        const renderedValue = Array.isArray(value)
+          ? value.join(", ")
+          : String(value);
+        parts.push(`    ${key}: ${normalizeContextDoc(renderedValue)}`);
+      }
+    }
 
     if (meta.errorEnums.length > 0) {
       parts.push("  Error Codes:");
@@ -609,6 +879,28 @@ export function buildContractContext(
       parts.push(
         `  Contract Meta Preview: ${renderCustomSectionPreview(meta.customSections.contractmetav0)}`,
       );
+    }
+  }
+
+  if (builtinInsights.length > 0) {
+    parts.push("\nBuilt-in Runtime Insights:");
+    for (const insight of builtinInsights) {
+      parts.push(`  ${insight.title}: ${normalizeContextDoc(insight.summary)}`);
+      parts.push(`    Trigger: ${normalizeContextDoc(insight.trigger)}`);
+      if (insight.relatedFunctions?.length) {
+        parts.push(`    Related Functions: ${insight.relatedFunctions.join(", ")}`);
+      }
+      if (insight.relatedCodes?.length) {
+        parts.push(`    Related Codes: ${insight.relatedCodes.join(", ")}`);
+      }
+      if (insight.debugHints?.length) {
+        for (const hint of insight.debugHints) {
+          parts.push(`    Hint: ${normalizeContextDoc(hint)}`);
+        }
+      }
+      for (const sourceRef of renderBuiltinSourceRefs(insight.sourceRefs)) {
+        parts.push(`    Source: ${sourceRef}`);
+      }
     }
   }
 

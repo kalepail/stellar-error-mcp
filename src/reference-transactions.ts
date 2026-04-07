@@ -16,6 +16,7 @@ async function findArchivedTransactionNearObservation(
   env: Env,
   txHash: string,
   observedAt: string,
+  rpcContext?: FailedTransaction["rpcContext"],
 ): Promise<FailedTransaction | null> {
   const observedMs = new Date(observedAt).getTime();
   if (Number.isNaN(observedMs)) return null;
@@ -25,7 +26,7 @@ async function findArchivedTransactionNearObservation(
   if (ageMs > oneDayMs) return null;
 
   const { getLatestLedger, scanForFailedTransactions } = await import("./stellar.js");
-  const latestLedger = await getLatestLedger(env);
+  const latestLedger = await getLatestLedger(env, rpcContext);
   const estimatedLedgersAgo = Math.ceil(ageMs / 5000);
   const searchSpan = Math.min(Math.max(estimatedLedgersAgo + 600, 600), 4000);
   const startLedger = Math.max(1, latestLedger - searchSpan);
@@ -34,6 +35,7 @@ async function findArchivedTransactionNearObservation(
     startLedger,
     searchSpan + 1,
     20_000,
+    rpcContext,
   );
 
   return result.transactions.find((transaction) => transaction.txHash === txHash) ?? null;
@@ -52,12 +54,20 @@ export async function ensureExampleTransaction(
 
   const txHash = pickReferenceTxHash(entry.exampleTxHash, entry.txHashes);
   if (!txHash) return null;
+  const preferredRpcContext = preferredTransaction?.rpcContext;
 
   const transaction = preferredTransaction
     ?? await findStagedFailedTransactionByTxHash(env, txHash)
     ?? await import("./stellar.js")
-      .then(({ getFailedTransactionByHash }) => getFailedTransactionByHash(env, txHash))
-    ?? await findArchivedTransactionNearObservation(env, txHash, entry.firstSeen);
+      .then(({ getFailedTransactionByHash }) =>
+        getFailedTransactionByHash(env, txHash, preferredRpcContext)
+      )
+    ?? await findArchivedTransactionNearObservation(
+      env,
+      txHash,
+      entry.firstSeen,
+      preferredRpcContext,
+    );
   if (!transaction) return null;
 
   let contracts:
@@ -66,7 +76,9 @@ export async function ensureExampleTransaction(
   if (transaction.contractIds.length > 0) {
     try {
       contracts = await import("./contracts.js")
-        .then(({ fetchContractsForError }) => fetchContractsForError(env, transaction.contractIds));
+        .then(({ fetchContractsForError }) =>
+          fetchContractsForError(env, transaction.contractIds, transaction.rpcContext)
+        );
     } catch {
       contracts = undefined;
     }

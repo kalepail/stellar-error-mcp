@@ -2,7 +2,12 @@ import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import { ingestFailedTransaction } from "./ingest.js";
-import { updateJob, sanitizeExampleTransaction, workflowStatusToAsyncStatus } from "./jobs.js";
+import {
+  updateJob,
+  sanitizeErrorEntry,
+  sanitizeExampleTransaction,
+  workflowStatusToAsyncStatus,
+} from "./jobs.js";
 import {
   cleanupTransientArtifactsForJob,
   getActiveDirectJob,
@@ -41,6 +46,38 @@ const LEDGER_SCAN_FAIL_LIMIT = 10_000;
 
 function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function disposeRpcStub(stub: unknown): void {
+  if (stub && typeof (stub as { dispose?: () => void }).dispose === "function") {
+    try {
+      (stub as { dispose: () => void }).dispose();
+    } catch {
+      // Best-effort cleanup for local dev RPC stubs.
+    }
+  }
+}
+
+function formatAnalysisProgressMessage(update: {
+  phase: string;
+  profileName: string;
+  attempt: number;
+  elapsedMs: number;
+  delayMs?: number;
+  error?: string;
+}): string {
+  const elapsedSeconds = Math.max(1, Math.round(update.elapsedMs / 1000));
+  const base = `Kimi analysis ${update.phase.replace(/_/g, " ")} (profile ${update.profileName}, attempt ${Math.max(update.attempt, 1)}, elapsed ${elapsedSeconds}s).`;
+  if (update.phase === "retry_scheduled" && update.delayMs) {
+    return `${base} Retrying in ${Math.max(1, Math.round(update.delayMs / 1000))}s.`;
+  }
+  if (update.phase === "failed" && update.error) {
+    return `${base} Last error: ${update.error}`;
+  }
+  if (update.phase === "attempt_heartbeat") {
+    return `Kimi analysis still in flight (profile ${update.profileName}, attempt ${Math.max(update.attempt, 1)}, elapsed ${elapsedSeconds}s).`;
+  }
+  return base;
 }
 
 function buildChunkStepName(startLedger: number, endLedger: number): string {
@@ -296,11 +333,42 @@ export class DirectErrorWorkflow extends WorkflowEntrypoint<
           progress: { completed: 3, total: 4, unit: "steps", message: "Analyzing and storing error." },
         });
 
-        const ingest = await ingestFailedTransaction(this.env, transaction as FailedTransaction);
+        const ingest = input.forceReanalyze
+          ? await ingestFailedTransaction(
+            this.env,
+            transaction as FailedTransaction,
+            {
+              forceReanalyze: true,
+              onAnalysisProgress: async (update) => {
+                await updateStoredJob(this.env, jobId, {
+                  phase: "analyzing",
+                  progress: {
+                    completed: 3,
+                    total: 4,
+                    unit: "steps",
+                    message: formatAnalysisProgressMessage(update),
+                  },
+                });
+              },
+            },
+          )
+          : await ingestFailedTransaction(this.env, transaction as FailedTransaction, {
+            onAnalysisProgress: async (update) => {
+              await updateStoredJob(this.env, jobId, {
+                phase: "analyzing",
+                progress: {
+                  completed: 3,
+                  total: 4,
+                  unit: "steps",
+                  message: formatAnalysisProgressMessage(update),
+                },
+              });
+            },
+          });
         const publicResult: DirectErrorJobResult = {
           duplicate: ingest.status === "duplicate",
           fingerprint: ingest.fingerprint,
-          entry: ingest.entry,
+          entry: sanitizeErrorEntry(ingest.entry),
           example: sanitizeExampleTransaction(ingest.example),
         };
         await storeJobStepResult(this.env, jobId, "ingest-direct-error", publicResult);
@@ -508,7 +576,12 @@ export async function syncJobWithWorkflowStatus(
     ? env.DIRECT_ERROR_WORKFLOW
     : env.LEDGER_RANGE_WORKFLOW;
   const instance = await binding.get(job.jobId);
-  const details = await instance.status();
+  let details: InstanceStatus;
+  try {
+    details = await instance.status();
+  } finally {
+    disposeRpcStub(instance);
+  }
   const nextStatus = workflowStatusToAsyncStatus(details.status);
 
   if (
