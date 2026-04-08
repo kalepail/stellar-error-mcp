@@ -46,6 +46,10 @@ vi.mock("@stellar/stellar-sdk", () => ({
   },
 }));
 
+vi.mock("../src/xdr.js", () => ({
+  decodeXdrWithType: vi.fn(() => null),
+}));
+
 vi.mock("../src/transaction.js", () => ({
   buildDecodedTransactionContext: (envelope: any, processing: any) => ({
     topLevelFunction:
@@ -86,6 +90,10 @@ vi.mock("../src/transaction.js", () => ({
         ?.invoke_contract?.contract_address,
     ].filter(Boolean),
   }),
+  extractOperationTypes: (envelope: any) => {
+    const body = envelope?.tx?.tx?.operations?.[0]?.body;
+    return body?.invoke_host_function ? ["invoke_host_function"] : [];
+  },
   collectContractIdsFromValue: (value: any) => {
     const contractId =
       value?.tx?.tx?.operations?.[0]?.body?.invoke_host_function?.host_function
@@ -196,5 +204,30 @@ describe("direct error normalization", () => {
     ]);
     expect(tx.processingJson).not.toHaveProperty("direct");
     expect(tx.sourcePayload).toBeUndefined();
+  });
+
+  it("preserves rpc context from direct submissions", async () => {
+    const { buildFailedTransactionFromDirectError } = await import("../src/direct.js");
+
+    const tx = await buildFailedTransactionFromDirectError({
+      kind: "rpc_simulate",
+      transactionXdr: "AAAA",
+      network: "testnet",
+      rpcEndpoint: "https://rpc-testnet.example.com",
+      archiveRpcEndpoint: "https://archive-rpc-testnet.example.com",
+      rpcAuthMode: "path",
+      response: {
+        latestLedger: 456,
+        error: "HostError: Error(Auth, InvalidAction)",
+        events: ["CCCC"],
+      },
+    });
+
+    expect(tx.rpcContext).toEqual({
+      network: "testnet",
+      rpcEndpoint: "https://rpc-testnet.example.com",
+      archiveRpcEndpoint: "https://archive-rpc-testnet.example.com",
+      authMode: "path",
+    });
   });
 });

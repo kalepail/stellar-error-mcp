@@ -91,6 +91,21 @@ describe("ingest idempotency", () => {
     expect(stored?.txHashes).toEqual(["tx-1"]);
   });
 
+  it("forceReanalyze refreshes an existing error without bumping seenCount", async () => {
+    const env = createTestEnv();
+    const tx = createFailedTx("tx-1");
+
+    const first = await ingestFailedTransaction(env, tx);
+    const second = await ingestFailedTransaction(env, tx, { forceReanalyze: true });
+
+    expect(first.status).toBe("new");
+    expect(second.status).toBe("new");
+
+    const stored = await getErrorEntry(env, first.fingerprint);
+    expect(stored?.seenCount).toBe(1);
+    expect(stored?.txHashes).toEqual(["tx-1"]);
+  });
+
   it("rolls back the stored example if the canonical error write fails", async () => {
     class FailingErrorsBucket extends MemoryR2Bucket {
       override async put(key: string, value: string, options?: R2PutOptions): Promise<void> {

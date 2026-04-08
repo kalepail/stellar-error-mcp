@@ -8,7 +8,7 @@ import {
   findErrorEntryByTxHash,
 } from "./storage.js";
 import { buildAiSearchFilters } from "./ai-search.js";
-import { sanitizeExampleTransaction } from "./jobs.js";
+import { sanitizeErrorEntry, sanitizeExampleTransaction } from "./jobs.js";
 import {
   buildStoredDiagnosisText,
   buildStoredSearchResult,
@@ -181,7 +181,10 @@ function createBaseServer(env: Env) {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify({ entry, example }, null, 2),
+                text: JSON.stringify({
+                  entry: sanitizeErrorEntry(entry),
+                  example,
+                }, null, 2),
               },
             ],
           };
@@ -197,7 +200,10 @@ function createBaseServer(env: Env) {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify({ entry: foundEntry, example }, null, 2),
+                text: JSON.stringify({
+                  entry: sanitizeErrorEntry(foundEntry),
+                  example,
+                }, null, 2),
               },
             ],
           };

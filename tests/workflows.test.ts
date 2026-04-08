@@ -27,6 +27,7 @@ vi.mock("../src/jobs.js", () => ({
     ...patch,
     updatedAt: "2026-04-02T00:01:00.000Z",
   }),
+  sanitizeErrorEntry: (entry: unknown) => entry,
   sanitizeExampleTransaction: (example: unknown) => example,
   workflowStatusToAsyncStatus: (status: string) =>
     status === "complete"
@@ -213,6 +214,9 @@ describe("workflow classes", () => {
     expect(ingestFailedTransaction).toHaveBeenCalledWith(
       env,
       expect.objectContaining({ txHash: "tx_direct_1" }),
+      expect.objectContaining({
+        onAnalysisProgress: expect.any(Function),
+      }),
     );
     await expect(getAsyncJob(env, "de_staged")).resolves.toMatchObject({
       status: "completed",
@@ -224,6 +228,65 @@ describe("workflow classes", () => {
         key.startsWith("job-staging/de_staged/"),
       ),
     ).toBe(false);
+  });
+
+  it("passes forceReanalyze through direct jobs to ingest", async () => {
+    const env = createTestEnv();
+    const tx = createFailedTx("tx_direct_force");
+    ingestFailedTransaction.mockResolvedValue({
+      status: "new",
+      fingerprint: "fp-direct-force",
+      entry: { fingerprint: "fp-direct-force" },
+      example: null,
+    });
+
+    await storeAsyncJob(env, {
+      jobId: "de_force",
+      kind: "direct_error",
+      status: "queued",
+      phase: "accepted",
+      createdAt: "2026-04-02T00:00:00.000Z",
+      updatedAt: "2026-04-02T00:00:00.000Z",
+      progress: { completed: 0, total: 4, unit: "steps" },
+    });
+    const stagedTransactionKey = await storeStagedFailedTransaction(
+      env,
+      "de_force",
+      tx.txHash,
+      tx,
+    );
+    await storeJobInput(env, "de_force", {
+      jobId: "de_force",
+      sourceReference: "rpcsend-force",
+      stagedTransactionKey,
+      txHash: tx.txHash,
+      forceReanalyze: true,
+    });
+
+    const { DirectErrorWorkflow } = await import("../src/workflows.js");
+    const workflow = new DirectErrorWorkflow(
+      { waitUntil: () => undefined } as ExecutionContext,
+      env,
+    );
+    const recorder = createStepRecorder();
+
+    await workflow.run(
+      {
+        payload: { jobId: "de_force" },
+        timestamp: new Date(),
+        instanceId: "de_force",
+      },
+      recorder.step,
+    );
+
+    expect(ingestFailedTransaction).toHaveBeenCalledWith(
+      env,
+      expect.objectContaining({ txHash: "tx_direct_force" }),
+      expect.objectContaining({
+        forceReanalyze: true,
+        onAnalysisProgress: expect.any(Function),
+      }),
+    );
   });
 
   it("stages chunk transactions and uses deterministic step names", async () => {

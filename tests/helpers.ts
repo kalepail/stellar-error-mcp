@@ -156,9 +156,15 @@ export function createTestEnv(
     STELLAR_ARCHIVE_RPC_ENDPOINT: "https://archive-rpc.example.com",
     STELLAR_RPC_ENDPOINT: "https://rpc.example.com",
     STELLAR_RPC_AUTH_MODE: "header",
+    STELLAR_TESTNET_ARCHIVE_RPC_ENDPOINT: "https://archive-rpc-testnet.example.com",
+    STELLAR_TESTNET_RPC_ENDPOINT: "https://rpc-testnet.example.com",
+    STELLAR_TESTNET_RPC_TOKEN: "testnet-token",
+    STELLAR_TESTNET_RPC_AUTH_MODE: "path",
     AI_SEARCH_INSTANCE: "search",
     AI_SEARCH_MODEL: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     AI_ANALYSIS_MODEL: "@cf/moonshotai/kimi-k2.5",
+    AI_ANALYSIS_TIMEOUT_MS: "5000",
+    AI_ANALYSIS_MAX_DURATION_MS: "15000",
     JOB_RETENTION_HOURS: "72",
   };
 }

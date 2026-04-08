@@ -7,6 +7,7 @@ import {
   createJobId,
   isTerminalJobStatus,
   preflightDirectErrorSubmission,
+  sanitizeErrorEntry,
   updateJob,
   workflowStatusToAsyncStatus,
   buildDirectWorkflowInput,
@@ -64,6 +65,27 @@ function timingSafeEqual(a: string, b: string): boolean {
 function isWorkflowInstanceMissing(error: unknown): boolean {
   const message = formatError(error);
   return message.includes("instance.not_found");
+}
+
+function disposeRpcStub(stub: unknown): void {
+  if (stub && typeof (stub as { dispose?: () => void }).dispose === "function") {
+    try {
+      (stub as { dispose: () => void }).dispose();
+    } catch {
+      // Best-effort cleanup for local dev RPC stubs.
+    }
+  }
+}
+
+function inferWorkflowBinding(
+  env: Env,
+  jobId: string,
+): Workflow<unknown> | null {
+  if (jobId.startsWith("de_")) return env.DIRECT_ERROR_WORKFLOW as Workflow<unknown>;
+  if (jobId.startsWith("lb_") || jobId.startsWith("rs_")) {
+    return env.LEDGER_RANGE_WORKFLOW as Workflow<unknown>;
+  }
+  return null;
 }
 
 function getManagementTokenFromRequest(request: Request): string | null {
@@ -198,6 +220,7 @@ async function createDirectErrorJob(
       preflight.sourceReference,
       stagedTransactionKey,
       preflight.transaction.txHash,
+      preflight.forceReanalyze,
     ),
   );
   await setActiveDirectJob(env, preflight.transaction.txHash, jobId);
@@ -206,11 +229,15 @@ async function createDirectErrorJob(
     id: jobId,
     params: { jobId },
   });
-  const details = await instance.status();
+  try {
+    // The workflow starts asynchronously; avoid an extra status RPC on create.
+  } finally {
+    disposeRpcStub(instance);
+  }
 
   const next = updateJob(job, {
-    workflowStatus: details.status,
-    status: workflowStatusToAsyncStatus(details.status),
+    workflowStatus: "queued",
+    status: workflowStatusToAsyncStatus("queued"),
   });
   await storeAsyncJob(env, next);
   return next;
@@ -223,6 +250,12 @@ async function createOrReuseDirectErrorJob(
     { duplicate: false }
   >,
 ): Promise<{ job: AsyncJob; reused: boolean }> {
+  if (preflight.forceReanalyze) {
+    await setActiveDirectJob(env, preflight.transaction.txHash, null);
+    const job = await createDirectErrorJob(env, preflight);
+    return { job, reused: false };
+  }
+
   const activeJobId = await getActiveDirectJob(env, preflight.transaction.txHash);
   if (activeJobId) {
     const current = await getAsyncJob(env, activeJobId);
@@ -257,11 +290,15 @@ async function createLedgerRangeJob(
     id: input.jobId,
     params: { jobId: input.jobId },
   });
-  const details = await instance.status();
+  try {
+    // The workflow starts asynchronously; avoid an extra status RPC on create.
+  } finally {
+    disposeRpcStub(instance);
+  }
 
   const next = updateJob(job, {
-    workflowStatus: details.status,
-    status: workflowStatusToAsyncStatus(details.status),
+    workflowStatus: "queued",
+    status: workflowStatusToAsyncStatus("queued"),
   });
   await storeAsyncJob(env, next);
 
@@ -327,6 +364,51 @@ async function getJobStatus(env: Env, jobId: string): Promise<AsyncJob | null> {
     }
   }
   return null;
+}
+
+async function buildDegradedWorkflowSnapshot(
+  env: Env,
+  jobId: string,
+  error: unknown,
+): Promise<Response> {
+  const binding = inferWorkflowBinding(env, jobId);
+  if (!binding) {
+    return Response.json(
+      {
+        status: "error",
+        message: formatError(error),
+      },
+      { status: 503 },
+    );
+  }
+
+  try {
+    const instance = await binding.get(jobId);
+    let details: InstanceStatus;
+    try {
+      details = await instance.status();
+    } finally {
+      disposeRpcStub(instance);
+    }
+    return Response.json(
+      {
+        jobId,
+        status: "degraded",
+        message: formatError(error),
+        workflowStatus: details.status,
+      },
+      { status: 503 },
+    );
+  } catch (workflowError) {
+    return Response.json(
+      {
+        status: "error",
+        message: formatError(error),
+        workflowError: formatError(workflowError),
+      },
+      { status: 503 },
+    );
+  }
 }
 
 function buildBatchInput(url: URL): LedgerRangeWorkflowInput | Response {
@@ -401,7 +483,7 @@ export default {
             duplicate: true,
             sourceReference: preflight.sourceReference,
             fingerprint: preflight.fingerprint,
-            entry: preflight.entry,
+            entry: sanitizeErrorEntry(preflight.entry),
             example: preflight.example,
           });
         }
@@ -467,7 +549,11 @@ export default {
           ? env.DIRECT_ERROR_WORKFLOW
           : env.LEDGER_RANGE_WORKFLOW;
         const instance = await binding.get(jobId);
-        await instance.terminate();
+        try {
+          await instance.terminate();
+        } finally {
+          disposeRpcStub(instance);
+        }
 
         const next = updateJob(job, {
           status: "failed",
@@ -510,17 +596,31 @@ export default {
       } catch (error) {
         const message = formatError(error);
         logError("http.job_status_failed", { jobId, error: message });
-        return Response.json({ status: "error", message }, { status: 500 });
+        return buildDegradedWorkflowSnapshot(env, jobId, error);
       }
     }
 
     if (url.pathname === "/" || url.pathname === "/health") {
-      const lastLedger = await getLastProcessedLedger(env);
-      return Response.json({
-        service: "stellar-error-mcp",
-        status: "ok",
-        lastProcessedLedger: lastLedger,
-      });
+      try {
+        const lastLedger = await getLastProcessedLedger(env);
+        return Response.json({
+          service: "stellar-error-mcp",
+          status: "ok",
+          lastProcessedLedger: lastLedger,
+        });
+      } catch (error) {
+        const message = formatError(error);
+        logError("http.health_failed", { error: message });
+        return Response.json(
+          {
+            service: "stellar-error-mcp",
+            status: "degraded",
+            lastProcessedLedger: null,
+            error: message,
+          },
+          { status: 503 },
+        );
+      }
     }
 
     return new Response("Not Found", { status: 404 });

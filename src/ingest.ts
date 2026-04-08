@@ -17,17 +17,24 @@ import {
   storeExampleTransaction,
   storeTxHashPointer,
 } from "./storage.js";
+import type { AnalysisProgressUpdate } from "./analysis.js";
 import { analyzeFailedTransaction } from "./analysis.js";
 import { buildErrorDescription, buildFingerprint } from "./fingerprint.js";
 import { buildContractContext, fetchContractsForError } from "./contracts.js";
 import { ensureExampleTransaction } from "./reference-transactions.js";
 import { attachDeepDecodedViews } from "./transaction.js";
+import { buildBuiltinInsights } from "./builtin-contracts.js";
 
 export interface IngestFailedTransactionResult {
   status: "duplicate" | "new";
   fingerprint: string;
   entry: ErrorEntry;
   example: ExampleTransactionRecord | null;
+}
+
+export interface IngestFailedTransactionOptions {
+  forceReanalyze?: boolean;
+  onAnalysisProgress?: (update: AnalysisProgressUpdate) => Promise<void> | void;
 }
 
 function formatError(error: unknown): string {
@@ -45,9 +52,11 @@ function logInfo(event: string, fields: Record<string, unknown> = {}): void {
 export async function ingestFailedTransaction(
   env: Env,
   tx: FailedTransaction,
+  options: IngestFailedTransactionOptions = {},
 ): Promise<IngestFailedTransactionResult> {
+  const forceReanalyze = options.forceReanalyze === true;
   const existingByTxHash = await findErrorEntryByTxHash(env, tx.txHash);
-  if (existingByTxHash) {
+  if (existingByTxHash && !forceReanalyze) {
     logInfo("ingest.txhash_reused", {
       fingerprint: existingByTxHash.fingerprint,
       txHash: tx.txHash,
@@ -65,7 +74,7 @@ export async function ingestFailedTransaction(
     await buildFingerprint(tx);
 
   const existing = await getErrorEntry(env, fingerprint);
-  if (existing) {
+  if (existing && !forceReanalyze) {
     await bumpErrorEntry(
       env,
       existing,
@@ -95,6 +104,8 @@ export async function ingestFailedTransaction(
     };
   }
 
+  const reanalysisBaseline = existing;
+
   const descriptionContracts = tx.primaryContractIds.length > 0
     ? tx.primaryContractIds
     : tx.contractIds;
@@ -103,35 +114,44 @@ export async function ingestFailedTransaction(
     functionName,
     errorSignatures,
     tx.resultKind,
+    tx.rpcContext?.network
+      ?? tx.rpcContext?.archiveRpcEndpoint
+      ?? tx.rpcContext?.rpcEndpoint,
   );
 
   let similarTo: string | undefined;
-  try {
-    const similar = await findSimilarError(env, description);
-    if (similar) {
-      similarTo = similar.fingerprint;
-      logInfo("ingest.similar_match", {
-        fingerprint,
+  if (reanalysisBaseline) {
+    similarTo = reanalysisBaseline.similarTo;
+  } else {
+    try {
+      const similar = await findSimilarError(env, description);
+      if (similar) {
+        similarTo = similar.fingerprint;
+        logInfo("ingest.similar_match", {
+          fingerprint,
+          txHash: tx.txHash,
+          observationKind: tx.observationKind,
+          similarTo,
+          score: Number(similar.score.toFixed(3)),
+        });
+      }
+    } catch (error) {
+      logWarn("ingest.similarity_skipped", {
         txHash: tx.txHash,
         observationKind: tx.observationKind,
-        similarTo,
-        score: Number(similar.score.toFixed(3)),
+        error: formatError(error),
       });
     }
-  } catch (error) {
-    logWarn("ingest.similarity_skipped", {
-      txHash: tx.txHash,
-      observationKind: tx.observationKind,
-      error: formatError(error),
-    });
   }
 
   let contracts: Map<string, ContractMetadata> | undefined;
   let contractContext: string | undefined;
+  let builtinInsights = buildBuiltinInsights(tx);
   if (tx.contractIds.length > 0) {
     try {
-      contracts = await fetchContractsForError(env, tx.contractIds);
-      contractContext = buildContractContext(contracts);
+      contracts = await fetchContractsForError(env, tx.contractIds, tx.rpcContext);
+      builtinInsights = buildBuiltinInsights(tx, contracts);
+      contractContext = buildContractContext(contracts, builtinInsights);
     } catch (error) {
       logWarn("ingest.contract_fetch_skipped", {
         txHash: tx.txHash,
@@ -139,6 +159,9 @@ export async function ingestFailedTransaction(
         error: formatError(error),
       });
     }
+  }
+  if (!contractContext && builtinInsights.length > 0) {
+    contractContext = buildContractContext(new Map(), builtinInsights);
   }
 
   const enrichedTx = {
@@ -150,11 +173,19 @@ export async function ingestFailedTransaction(
     ),
   };
 
-  const analysis = await analyzeFailedTransaction(env, enrichedTx, contracts);
+  const analysis = await analyzeFailedTransaction(
+    env,
+    enrichedTx,
+    contracts,
+    { onProgress: options.onAnalysisProgress },
+  );
+  const txHashAlreadyTracked = reanalysisBaseline?.txHashes.includes(enrichedTx.txHash) ?? false;
 
   const entry: ErrorEntry = {
     fingerprint,
-    observationKinds: [enrichedTx.observationKind],
+    observationKinds: reanalysisBaseline
+      ? [...new Set([...reanalysisBaseline.observationKinds, enrichedTx.observationKind])]
+      : [enrichedTx.observationKind],
     contractIds: enrichedTx.contractIds,
     functionName,
     errorSignatures,
@@ -170,10 +201,15 @@ export async function ingestFailedTransaction(
     debugSteps: analysis.debugSteps,
     confidence: analysis.confidence,
     modelId: analysis.modelId,
-    seenCount: 1,
-    txHashes: [enrichedTx.txHash],
-    firstSeen: enrichedTx.ledgerCloseTime,
-    lastSeen: enrichedTx.ledgerCloseTime,
+    seenCount: reanalysisBaseline?.seenCount ?? 1,
+    txHashes: reanalysisBaseline
+      ? [...reanalysisBaseline.txHashes.filter((h) => h !== enrichedTx.txHash), enrichedTx.txHash]
+        .slice(-50)
+      : [enrichedTx.txHash],
+    firstSeen: reanalysisBaseline?.firstSeen ?? enrichedTx.ledgerCloseTime,
+    lastSeen: reanalysisBaseline
+      ? txHashAlreadyTracked ? reanalysisBaseline.lastSeen : enrichedTx.ledgerCloseTime
+      : enrichedTx.ledgerCloseTime,
     similarTo,
     exampleTxHash: enrichedTx.txHash,
     exampleReadout: enrichedTx.readout,
@@ -219,15 +255,26 @@ export async function ingestFailedTransaction(
     });
   }
 
-  logInfo("ingest.new_error", {
-    fingerprint,
-    txHash: tx.txHash,
-    observationKind: tx.observationKind,
-    resultKind: tx.resultKind,
-    errorCategory: entry.errorCategory,
-    confidence: entry.confidence,
-    similarTo: similarTo ?? null,
-  });
+  if (reanalysisBaseline) {
+    logInfo("ingest.reanalyzed", {
+      fingerprint,
+      txHash: tx.txHash,
+      observationKind: tx.observationKind,
+      resultKind: tx.resultKind,
+      errorCategory: entry.errorCategory,
+      confidence: entry.confidence,
+    });
+  } else {
+    logInfo("ingest.new_error", {
+      fingerprint,
+      txHash: tx.txHash,
+      observationKind: tx.observationKind,
+      resultKind: tx.resultKind,
+      errorCategory: entry.errorCategory,
+      confidence: entry.confidence,
+      similarTo: similarTo ?? null,
+    });
+  }
 
   return {
     status: "new",

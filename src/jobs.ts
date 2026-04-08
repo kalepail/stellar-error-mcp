@@ -7,6 +7,9 @@ import type {
   DirectErrorSubmission,
   DirectErrorWorkflowInput,
   FailedTransaction,
+  PublicContractMetadata,
+  PublicDecodedTransactionContext,
+  PublicErrorEntry,
   PublicExampleTransactionRecord,
 } from "./types.js";
 import { buildFingerprint } from "./fingerprint.js";
@@ -42,6 +45,7 @@ export interface DuplicatePreflightMiss {
   transaction: FailedTransaction;
   fingerprint: string;
   sourceReference: string;
+  forceReanalyze: boolean;
 }
 
 export type DuplicatePreflightResult =
@@ -126,16 +130,10 @@ export function sanitizeExampleTransaction(
 ): PublicExampleTransactionRecord | null {
   if (!example) return null;
 
-  const transaction = {
-    ...example.transaction,
-    processingJson: scrubSubmissionData(example.transaction.processingJson),
-    decoded: scrubSubmissionData(example.transaction.decoded) as typeof example.transaction.decoded,
-  };
-  delete (transaction as { sourcePayload?: unknown }).sourcePayload;
-
   return {
     ...example,
-    transaction,
+    transaction: sanitizeFailedTransaction(example.transaction),
+    contracts: sanitizeContractMetadata(example.contracts),
   };
 }
 
@@ -156,6 +154,161 @@ function scrubSubmissionData(value: unknown): unknown {
   return next;
 }
 
+function compactPublicValue(
+  value: unknown,
+  depth = 0,
+): unknown {
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === "string") {
+    return value.length > 600 ? `${value.slice(0, 600)}... [truncated]` : value;
+  }
+  if (typeof value !== "object") return value;
+  if (depth >= 4) return "[max-depth]";
+
+  if (Array.isArray(value)) {
+    const limit = depth <= 1 ? 6 : 4;
+    const next = value.slice(0, limit).map((item) => compactPublicValue(item, depth + 1));
+    if (value.length > limit) {
+      next.push({
+        _truncated: true,
+        keptItems: limit,
+        remainingItems: value.length - limit,
+      });
+    }
+    return next;
+  }
+
+  const record = value as Record<string, unknown>;
+  const normalized =
+    "_attributes" in record && Object.keys(record).length <= 2
+      ? record._attributes
+      : record;
+
+  const next: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(normalized as Record<string, unknown>)) {
+    if (
+      key === "_maxDepth" ||
+      key === "_armType" ||
+      key === "_childType" ||
+      key === "direct" ||
+      key === "sourcePayload"
+    ) {
+      continue;
+    }
+    next[key] = compactPublicValue(inner, depth + 1);
+  }
+  return next;
+}
+
+function buildEventPreview(events: unknown[]): { count: number; preview: unknown[] } {
+  return {
+    count: events.length,
+    preview: events.slice(0, 3).map((event) => compactPublicValue(event)),
+  };
+}
+
+function sanitizeReadout(
+  readout: FailedTransaction["readout"],
+): FailedTransaction["readout"] {
+  return {
+    ...readout,
+    simulationError:
+      typeof readout.simulationError === "string" && readout.simulationError.length > 1200
+        ? `${readout.simulationError.slice(0, 1200)}... [truncated]`
+        : readout.simulationError,
+  };
+}
+
+function sanitizeDecodedContext(
+  decoded: FailedTransaction["decoded"],
+): PublicDecodedTransactionContext {
+  return {
+    topLevelFunction: decoded.topLevelFunction,
+    errorSignatures: decoded.errorSignatures,
+    invokeCalls: decoded.invokeCalls.slice(0, 6).map((call) => ({
+      contractId: call.contractId,
+      functionName: call.functionName,
+      argCount: call.argCount ?? (Array.isArray(call.args) ? call.args.length : undefined),
+      authCount: call.authCount ?? (Array.isArray(call.auth) ? call.auth.length : undefined),
+    })),
+    authEntryCount: decoded.authEntries.length,
+    authEntryPreview: decoded.authEntries.slice(0, 3).map((entry) => compactPublicValue(entry)),
+    resourceLimits: decoded.resourceLimits,
+    transactionResult: compactPublicValue(decoded.transactionResult),
+    contractEvents: buildEventPreview(decoded.contractEvents),
+    diagnosticEvents: buildEventPreview(decoded.diagnosticEvents),
+    processingOperationCount: decoded.processingOperations.length,
+    ledgerChangeCount: decoded.ledgerChanges.length,
+    touchedContractIds: decoded.touchedContractIds,
+  };
+}
+
+export function sanitizeFailedTransaction(
+  transaction: FailedTransaction,
+): PublicExampleTransactionRecord["transaction"] {
+  return {
+    observationKind: transaction.observationKind,
+    txHash: transaction.txHash,
+    ledgerSequence: transaction.ledgerSequence,
+    ledgerCloseTime: transaction.ledgerCloseTime,
+    resultKind: transaction.resultKind,
+    soroban: transaction.soroban,
+    primaryContractIds: transaction.primaryContractIds,
+    contractIds: transaction.contractIds,
+    operationTypes: transaction.operationTypes,
+    sorobanOperationTypes: transaction.sorobanOperationTypes,
+    readout: sanitizeReadout(transaction.readout),
+    rpcContext: transaction.rpcContext,
+    decoded: sanitizeDecodedContext(
+      scrubSubmissionData(transaction.decoded) as FailedTransaction["decoded"],
+    ),
+  };
+}
+
+function sanitizeContractMetadata(
+  contracts: ExampleTransactionRecord["contracts"],
+): PublicContractMetadata[] {
+  return contracts.map((contract) => ({
+    contractId: contract.contractId,
+    wasmHash: contract.wasmHash,
+    contractType: contract.contractType,
+    builtin: contract.builtin,
+    notes: contract.notes,
+    assetMetadata: contract.assetMetadata,
+    functionCount: contract.functions.length,
+    errorEnumCount: contract.errorEnums.length,
+    structCount: contract.structs.length,
+  }));
+}
+
+export function sanitizeErrorEntry(
+  entry: ErrorEntry,
+): PublicErrorEntry {
+  return {
+    fingerprint: entry.fingerprint,
+    observationKinds: entry.observationKinds,
+    contractIds: entry.contractIds,
+    functionName: entry.functionName,
+    errorSignatures: entry.errorSignatures,
+    resultKind: entry.resultKind,
+    sorobanOperationTypes: entry.sorobanOperationTypes,
+    summary: entry.summary,
+    errorCategory: entry.errorCategory,
+    likelyCause: entry.likelyCause,
+    suggestedFix: entry.suggestedFix,
+    detailedAnalysis: entry.detailedAnalysis,
+    evidence: entry.evidence,
+    relatedCodes: entry.relatedCodes,
+    debugSteps: entry.debugSteps,
+    confidence: entry.confidence,
+    modelId: entry.modelId,
+    seenCount: entry.seenCount,
+    firstSeen: entry.firstSeen,
+    lastSeen: entry.lastSeen,
+    exampleTxHash: entry.exampleTxHash,
+  };
+}
+
 export async function preflightDirectErrorSubmission(
   env: Env,
   submission: DirectErrorSubmission,
@@ -163,6 +316,18 @@ export async function preflightDirectErrorSubmission(
   const { buildFailedTransactionFromDirectError } = await import("./direct.js");
   const transaction = await buildFailedTransactionFromDirectError(submission);
   const sourceReference = transaction.readout.sourceReference ?? transaction.txHash;
+  const forceReanalyze = submission.forceReanalyze === true;
+
+  if (forceReanalyze) {
+    const { fingerprint } = await buildFingerprint(transaction);
+    return {
+      duplicate: false,
+      transaction,
+      fingerprint,
+      sourceReference,
+      forceReanalyze: true,
+    };
+  }
 
   const exactByTxHash = await findErrorEntryByTxHash(env, transaction.txHash);
   if (exactByTxHash) {
@@ -194,6 +359,7 @@ async function applyFingerprintDuplicateCheck(
       transaction,
       fingerprint,
       sourceReference: transaction.readout.sourceReference ?? transaction.txHash,
+      forceReanalyze: false,
     };
   }
 
@@ -230,11 +396,13 @@ export function buildDirectWorkflowInput(
   sourceReference: string,
   stagedTransactionKey: string,
   txHash: string,
+  forceReanalyze = false,
 ): DirectErrorWorkflowInput {
   return {
     jobId,
     sourceReference,
     stagedTransactionKey,
     txHash,
+    forceReanalyze,
   };
 }
