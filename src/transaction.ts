@@ -1,3 +1,4 @@
+import { Address, StrKey } from "@stellar/stellar-sdk";
 import type {
   DecodedTransactionContext,
   ErrorSignature,
@@ -6,7 +7,6 @@ import type {
   TransactionOperationContext,
   TransactionResourceLimits,
 } from "./types.js";
-import { StrKey } from "@stellar/stellar-sdk";
 import { deepDecodeXdr } from "./xdr.js";
 
 const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
@@ -18,6 +18,14 @@ const SOROBAN_OPERATION_TYPES = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasMethod<T extends string>(
+  value: unknown,
+  method: T,
+): value is Record<T, (...args: unknown[]) => unknown> {
+  return !!value && typeof value === "object" &&
+    typeof (value as Record<T, unknown>)[method] === "function";
 }
 
 function toSnakeCase(value: string): string {
@@ -123,6 +131,41 @@ function extractSdkErrorSignature(value: unknown): ErrorSignature | null {
   };
 }
 
+function extractJsonXdrErrorSignature(value: unknown): ErrorSignature | null {
+  if (!isRecord(value) || !isRecord(value._switch)) {
+    return null;
+  }
+
+  const family = value._switch.name;
+  if (typeof family !== "string" || !family.startsWith("sce")) {
+    return null;
+  }
+
+  const rawCode = value._value;
+  if (isRecord(rawCode) && typeof rawCode.name === "string") {
+    return {
+      type: normalizeSdkErrorToken(family),
+      code: normalizeSdkErrorToken(rawCode.name),
+    };
+  }
+
+  if (isRecord(rawCode) && ("value" in rawCode)) {
+    return {
+      type: normalizeSdkErrorToken(family),
+      code: String(rawCode.value).replace(/^#/, ""),
+    };
+  }
+
+  if (typeof rawCode === "number" || typeof rawCode === "string") {
+    return {
+      type: normalizeSdkErrorToken(family),
+      code: String(rawCode).replace(/^#/, ""),
+    };
+  }
+
+  return null;
+}
+
 function getRecordPath(
   value: unknown,
   path: string[],
@@ -133,6 +176,287 @@ function getRecordPath(
     current = current[segment];
   }
   return current;
+}
+
+function normalizeIdentifier(value: string): string {
+  return value
+    .replace(/^scv/, "")
+    .replace(/^sce/, "")
+    .replace(/^hostFunctionType/, "")
+    .replace(/^operationType/, "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase();
+}
+
+function readXdrSwitchName(value: unknown): string | undefined {
+  if (!hasMethod(value, "switch")) return undefined;
+  const switchValue = value.switch();
+  if (switchValue && typeof switchValue === "object" && "name" in switchValue) {
+    const name = (switchValue as { name?: unknown }).name;
+    return typeof name === "string" ? name : undefined;
+  }
+  return undefined;
+}
+
+function bufferToContractId(value: unknown): string | undefined {
+  if (value instanceof Uint8Array && value.length === 32) {
+    return StrKey.encodeContract(value);
+  }
+  if (Array.isArray(value) && value.every((item) => typeof item === "number")) {
+    const bytes = Uint8Array.from(value);
+    if (bytes.length === 32) {
+      return StrKey.encodeContract(bytes);
+    }
+  }
+  return undefined;
+}
+
+function scAddressToString(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  const contractId = bufferToContractId(value);
+  if (contractId) return contractId;
+
+  if (hasMethod(value, "toXDR")) {
+    try {
+      return Address.fromScAddress(value as never).toString();
+    } catch {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+function xdrStringValue(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (value instanceof Uint8Array) return Buffer.from(value).toString("utf8");
+  return undefined;
+}
+
+function normalizeScErrorCode(value: unknown): string {
+  if (typeof value === "number" || typeof value === "bigint") {
+    return String(value);
+  }
+  if (value && typeof value === "object" && "name" in value) {
+    const name = (value as { name?: unknown }).name;
+    if (typeof name === "string") return normalizeIdentifier(name);
+  }
+  return String(value);
+}
+
+function extractXdrErrorSignature(value: unknown): ErrorSignature | null {
+  if (!hasMethod(value, "switch") || !hasMethod(value, "value")) {
+    return null;
+  }
+
+  const typeName = readXdrSwitchName(value);
+  if (!typeName || !typeName.startsWith("sce")) return null;
+
+  return {
+    type: normalizeIdentifier(typeName),
+    code: normalizeScErrorCode(value.value()),
+  };
+}
+
+function collectXdrErrors(value: unknown): ErrorSignature[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => collectXdrErrors(item));
+  }
+
+  const direct = extractXdrErrorSignature(value);
+  if (direct) return [direct];
+
+  if (
+    hasMethod(value, "switch") &&
+    readXdrSwitchName(value) === "scvError" &&
+    hasMethod(value, "error")
+  ) {
+    const fromScVal = extractXdrErrorSignature(value.error());
+    return fromScVal ? [fromScVal] : [];
+  }
+
+  if (
+    hasMethod(value, "switch") &&
+    readXdrSwitchName(value) === "scvVec" &&
+    hasMethod(value, "vec")
+  ) {
+    return collectXdrErrors(value.vec() ?? []);
+  }
+
+  if (
+    hasMethod(value, "switch") &&
+    readXdrSwitchName(value) === "scvMap" &&
+    hasMethod(value, "map")
+  ) {
+    return collectXdrErrors(value.map() ?? []);
+  }
+
+  return [];
+}
+
+function getEnvelopeFromXdrEnvelope(envelope: unknown): unknown | null {
+  if (!hasMethod(envelope, "value")) return null;
+  return envelope.value();
+}
+
+function getTransactionFromEnvelope(envelope: unknown): unknown | null {
+  const value = getEnvelopeFromXdrEnvelope(envelope);
+  if (!value) return null;
+
+  if (hasMethod(value, "tx")) {
+    return value.tx();
+  }
+
+  if (hasMethod(value, "innerTx")) {
+    const innerTx = value.innerTx();
+    if (hasMethod(innerTx, "v1")) {
+      const v1 = innerTx.v1();
+      if (hasMethod(v1, "tx")) return v1.tx();
+    }
+  }
+
+  return null;
+}
+
+function getInvokeContractArgsFromOperation(operation: unknown): {
+  contractId?: string;
+  functionName?: string;
+  args?: unknown[];
+  auth?: unknown[];
+} | null {
+  if (isRecord(operation)) {
+    const invoke = (operation as any)?.body?.invoke_host_function;
+    const invokeContract = invoke?.host_function?.invoke_contract;
+    if (invokeContract) {
+      return {
+        contractId:
+          typeof invokeContract.contract_address === "string"
+            ? invokeContract.contract_address
+            : undefined,
+        functionName:
+          typeof invokeContract.function_name === "string"
+            ? invokeContract.function_name
+            : undefined,
+        args: Array.isArray(invokeContract.args) ? invokeContract.args : undefined,
+        auth: Array.isArray(invoke?.auth) ? invoke.auth : undefined,
+      };
+    }
+  }
+
+  if (!hasMethod(operation, "body")) return null;
+  const body = operation.body();
+  if (
+    !hasMethod(body, "switch") ||
+    normalizeIdentifier(readXdrSwitchName(body) ?? "") !== "invoke_host_function"
+  ) {
+    return null;
+  }
+
+  const invoke = hasMethod(body, "invokeHostFunctionOp")
+    ? body.invokeHostFunctionOp()
+    : body.value();
+  if (!invoke || !hasMethod(invoke, "hostFunction")) return null;
+
+  const hostFunction = invoke.hostFunction();
+  if (
+    !hasMethod(hostFunction, "switch") ||
+    normalizeIdentifier(readXdrSwitchName(hostFunction) ?? "") !== "invoke_contract"
+  ) {
+    return null;
+  }
+
+  const invokeContract = hasMethod(hostFunction, "invokeContract")
+    ? hostFunction.invokeContract()
+    : hostFunction.value();
+  if (!invokeContract) return null;
+
+  return {
+    contractId:
+      hasMethod(invokeContract, "contractAddress")
+        ? scAddressToString(invokeContract.contractAddress())
+        : undefined,
+    functionName:
+      hasMethod(invokeContract, "functionName")
+        ? xdrStringValue(invokeContract.functionName())
+        : undefined,
+    args: hasMethod(invokeContract, "args") ? invokeContract.args() : undefined,
+    auth: hasMethod(invoke, "auth") ? invoke.auth() : undefined,
+  };
+}
+
+function extractDiagnosticEventContractId(event: unknown): string | undefined {
+  if (hasMethod(event, "event")) {
+    const inner = event.event();
+    if (hasMethod(inner, "contractId")) {
+      return bufferToContractId(inner.contractId());
+    }
+  }
+
+  if (isRecord(event)) {
+    const nestedEvent = isRecord(event._attributes)
+      ? (event._attributes as Record<string, unknown>).event
+      : undefined;
+    const nestedAttributes = isRecord(nestedEvent)
+      ? (nestedEvent as Record<string, unknown>)._attributes as Record<string, unknown> | undefined
+      : undefined;
+    const nestedContractId = nestedAttributes?.contractId;
+    if (nestedContractId) {
+      const decoded = bufferToContractId(nestedContractId);
+      if (decoded) return decoded;
+    }
+    if (typeof event.contract_id === "string") return event.contract_id;
+    if (typeof event.contractId === "string") return event.contractId;
+  }
+
+  return undefined;
+}
+
+function extractDiagnosticEventPayload(event: unknown): {
+  contractId?: string;
+  topics: unknown[];
+  data: unknown;
+} | null {
+  if (hasMethod(event, "event")) {
+    const inner = event.event();
+    if (!hasMethod(inner, "body")) return null;
+    const body = inner.body();
+    const v0 = hasMethod(body, "v0")
+      ? body.v0()
+      : hasMethod(body, "value")
+      ? body.value()
+      : null;
+    const topics = v0 && hasMethod(v0, "topics") ? v0.topics() : [];
+    const data = v0 && hasMethod(v0, "data") ? v0.data() : undefined;
+    return {
+      contractId: extractDiagnosticEventContractId(event),
+      topics: Array.isArray(topics) ? topics : [],
+      data,
+    };
+  }
+
+  if (isRecord(event)) {
+    const evt = event as Record<string, unknown>;
+    const body = evt.body as Record<string, unknown> | undefined;
+    const nestedEvent = isRecord(evt._attributes)
+      ? (evt._attributes as Record<string, unknown>).event
+      : undefined;
+    const nestedAttributes = isRecord(nestedEvent)
+      ? (nestedEvent as Record<string, unknown>)._attributes as Record<string, unknown> | undefined
+      : undefined;
+    const nestedBody = nestedAttributes?.body as Record<string, unknown> | undefined;
+    const nestedValue = nestedBody?._value as Record<string, unknown> | undefined;
+    const nestedV0 = nestedValue?._attributes as Record<string, unknown> | undefined;
+    const v0 = body?.v0 as Record<string, unknown> | undefined;
+    const topics = (v0?.topics ?? body?.topics ?? nestedV0?.topics) as unknown[] ?? [];
+    const data = v0?.data ?? body?.data ?? nestedV0?.data;
+    return {
+      contractId: extractDiagnosticEventContractId(event),
+      topics,
+      data,
+    };
+  }
+
+  return null;
 }
 
 export function walkJson(
@@ -164,6 +488,16 @@ export function collectContractIdsFromValue(obj: unknown): string[] {
 }
 
 function collectFunctionNames(value: unknown): string[] {
+  const transaction = getTransactionFromEnvelope(value);
+  if (transaction && hasMethod(transaction, "operations")) {
+    return transaction
+      .operations()
+      .flatMap((operation: unknown) => {
+        const invoke = getInvokeContractArgsFromOperation(operation);
+        return invoke?.functionName ? [invoke.functionName] : [];
+      });
+  }
+
   const results: string[] = [];
   if (Array.isArray(value)) {
     for (const item of value) results.push(...collectFunctionNames(item));
@@ -194,8 +528,21 @@ function collectFunctionNames(value: unknown): string[] {
 export function extractErrorSignatures(
   diagnosticEvents: unknown[],
 ): ErrorSignature[] {
+  const xdrSignatures = diagnosticEvents.flatMap((event) => {
+    const payload = extractDiagnosticEventPayload(event);
+    if (!payload) return collectXdrErrors(event);
+    return [...collectXdrErrors(payload.topics), ...collectXdrErrors(payload.data)];
+  });
+
   const seen = new Set<string>();
   const signatures: ErrorSignature[] = [];
+
+  for (const signature of xdrSignatures) {
+    const key = `${signature.type}:${signature.code}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    signatures.push(signature);
+  }
 
   const visit = (value: unknown): void => {
     if (typeof value === "string") {
@@ -236,6 +583,15 @@ export function extractErrorSignatures(
       }
     }
 
+    const jsonXdrSignature = extractJsonXdrErrorSignature(value);
+    if (jsonXdrSignature) {
+      const key = `${jsonXdrSignature.type}:${jsonXdrSignature.code}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        signatures.push(jsonXdrSignature);
+      }
+    }
+
     for (const inner of Object.values(value)) {
       visit(inner);
     }
@@ -249,6 +605,12 @@ export function extractErrorSignatures(
 }
 
 export function extractOperationType(operation: unknown): string | undefined {
+  if (hasMethod(operation, "body")) {
+    const body = operation.body();
+    const switchName = readXdrSwitchName(body);
+    if (switchName) return normalizeIdentifier(switchName);
+  }
+
   const body = (operation as any)?.body ?? (operation as any)?._attributes?.body;
   if (!isRecord(body)) return undefined;
 
@@ -328,6 +690,11 @@ export function extractFunctionName(envelopeJson: unknown): string {
 }
 
 export function extractEnvelopeOperations(envelope: unknown): unknown[] {
+  const transaction = getTransactionFromEnvelope(envelope);
+  if (transaction && hasMethod(transaction, "operations")) {
+    return transaction.operations();
+  }
+
   const candidates = [
     getRecordPath(envelope, ["tx", "tx", "operations"]),
     getRecordPath(envelope, ["tx_fee_bump", "tx", "inner_tx", "tx", "tx", "operations"]),
@@ -353,7 +720,9 @@ export function extractInvokeCalls(envelope: unknown): TransactionInvokeCall[] {
   const calls: TransactionInvokeCall[] = [];
 
   for (const operation of extractEnvelopeOperations(envelope)) {
-    const call = extractFlattenedInvokeCall(operation) ?? extractSdkInvokeCall(operation);
+    const call = getInvokeContractArgsFromOperation(operation) ??
+      extractFlattenedInvokeCall(operation) ??
+      extractSdkInvokeCall(operation);
     if (call) calls.push(call);
   }
 
@@ -361,6 +730,12 @@ export function extractInvokeCalls(envelope: unknown): TransactionInvokeCall[] {
 }
 
 export function extractAuthEntries(envelope: unknown): unknown[] {
+  const invokeAuth = extractInvokeCalls(envelope)
+    .flatMap((call) => Array.isArray(call.auth) ? call.auth : []);
+  if (invokeAuth.length > 0) {
+    return invokeAuth;
+  }
+
   const entries: unknown[] = [];
 
   walkJson(envelope, (key, value) => {
@@ -546,8 +921,19 @@ export function buildDecodedTransactionContext(
 ): DecodedTransactionContext {
   const diagnosticEvents = extractDiagnosticEvents(processing);
   const operationContexts = buildOperationContexts(envelope, processing);
+  const invokeCalls = extractInvokeCalls(envelope);
+  const errorSignatures = extractErrorSignatures(diagnosticEvents);
   const touchedContractIds = new Set<string>();
 
+  for (const call of invokeCalls) {
+    if (typeof call.contractId === "string" && call.contractId.length > 0) {
+      touchedContractIds.add(call.contractId);
+    }
+  }
+  for (const event of diagnosticEvents) {
+    const contractId = extractDiagnosticEventContractId(event);
+    if (contractId) touchedContractIds.add(contractId);
+  }
   for (const contractId of collectContractIdsFromValue(envelope)) {
     touchedContractIds.add(contractId);
   }
@@ -557,8 +943,8 @@ export function buildDecodedTransactionContext(
 
   return {
     topLevelFunction: extractFunctionName(envelope),
-    errorSignatures: extractErrorSignatures(diagnosticEvents),
-    invokeCalls: extractInvokeCalls(envelope),
+    errorSignatures,
+    invokeCalls,
     authEntries: extractAuthEntries(envelope),
     resourceLimits: extractResourceLimits(envelope),
     transactionResult: extractResultDetails(processing),

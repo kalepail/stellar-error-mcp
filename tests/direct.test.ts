@@ -100,6 +100,8 @@ vi.mock("../src/transaction.js", () => ({
         ?.invoke_contract?.contract_address;
     return contractId ? [contractId] : [];
   },
+  extractEnvelopeOperations: (envelope: any) =>
+    envelope?.tx?.tx?.operations ?? [],
 }));
 
 describe("direct error normalization", () => {
@@ -229,5 +231,26 @@ describe("direct error normalization", () => {
       archiveRpcEndpoint: "https://archive-rpc-testnet.example.com",
       authMode: "path",
     });
+  });
+
+  it("rejects malformed diagnostic event xdr instead of silently dropping it", async () => {
+    const stellar = await import("@stellar/stellar-sdk");
+    vi.mocked(stellar.xdr.DiagnosticEvent.fromXDR).mockImplementationOnce(() => {
+      throw new Error("invalid xdr");
+    });
+
+    const { buildFailedTransactionFromDirectError } = await import("../src/direct.js");
+
+    await expect(
+      buildFailedTransactionFromDirectError({
+        kind: "rpc_simulate",
+        transactionXdr: "AAAA",
+        response: {
+          latestLedger: 456,
+          error: "HostError: Error(Auth, InvalidAction)",
+          events: ["BROKEN"],
+        },
+      }),
+    ).rejects.toThrow("Invalid diagnostic event at index 0");
   });
 });

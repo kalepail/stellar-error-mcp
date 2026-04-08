@@ -39,6 +39,9 @@ function normalizeTimestamp(value: unknown, fallback: string): string {
     return new Date(value * 1000).toISOString();
   }
   if (typeof value === "string" && value.trim()) {
+    if (/^\d+$/.test(value.trim())) {
+      return new Date(Number(value.trim()) * 1000).toISOString();
+    }
     const date = new Date(value);
     if (!Number.isNaN(date.getTime())) return date.toISOString();
   }
@@ -86,6 +89,17 @@ async function parseResultXdr(xdrBase64: string): Promise<unknown> {
   );
 }
 
+async function parseResultMetaXdr(xdrBase64: string): Promise<unknown> {
+  return await decodePreferredXdr(
+    normalizeXdrBase64(xdrBase64),
+    "TransactionMeta",
+    () =>
+      xdrToJson(
+        xdr.TransactionMeta.fromXDR(normalizeXdrBase64(xdrBase64), "base64"),
+      ),
+  );
+}
+
 function normalizeTxResultKind(value: string): string {
   return normalizeCode(
     value.replace(/([a-z0-9])([A-Z])/g, "$1_$2"),
@@ -119,6 +133,19 @@ function extractTxResultSwitchName(value: unknown): string | null {
 }
 
 function extractRpcSendResultKind(resultJson: unknown): string | null {
+  if (
+    resultJson &&
+    typeof resultJson === "object" &&
+    typeof (resultJson as { result?: () => { switch?: () => { name?: string } } }).result === "function"
+  ) {
+    const switchName = (resultJson as {
+      result: () => { switch?: () => { name?: string } };
+    }).result()?.switch?.()?.name;
+    if (typeof switchName === "string" && switchName.length > 0) {
+      return normalizeTxResultKind(switchName);
+    }
+  }
+
   const directKey = findMatchingKey(
     resultJson,
     (key) => /^tx(?:_|[A-Z])/.test(key),
@@ -133,23 +160,171 @@ function extractRpcSendResultKind(resultJson: unknown): string | null {
 
 async function parseDiagnosticEvents(events: unknown): Promise<unknown[]> {
   if (!Array.isArray(events)) return [];
-  const decoded = await Promise.all(events.map(async (item) => {
-      if (typeof item === "string" && item.length > 0) {
-        return decodePreferredXdr(
-          normalizeXdrBase64(item),
-          "DiagnosticEvent",
-          () =>
-            xdrToJson(
-              xdr.DiagnosticEvent.fromXDR(normalizeXdrBase64(item), "base64"),
-            ),
+  const parsed: unknown[] = [];
+
+  for (const [index, item] of events.entries()) {
+    if (typeof item === "string" && item.length > 0) {
+      try {
+        parsed.push(
+          xdrToJson(
+            xdr.DiagnosticEvent.fromXDR(normalizeXdrBase64(item), "base64"),
+          ),
         );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Invalid diagnostic event at index ${index}: ${message}`);
       }
-      if (isRecord(item)) {
-        return item;
+      continue;
+    }
+
+    if (isRecord(item)) {
+      parsed.push(item);
+      continue;
+    }
+
+    throw new Error(
+      `Invalid diagnostic event at index ${index}: expected base64 XDR string or object.`,
+    );
+  }
+
+  return parsed;
+}
+
+function normalizeTransactionMeta(meta: unknown, diagnosticEvents: unknown[]): unknown {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return {
+      v4: {
+        operations: [],
+        events: [],
+        diagnostic_events: diagnosticEvents,
+        soroban_meta: null,
+      },
+    };
+  }
+
+  const candidate = JSON.parse(JSON.stringify(meta)) as Record<string, unknown>;
+  if ("v4" in candidate && candidate.v4 && typeof candidate.v4 === "object") {
+    const v4 = candidate.v4 as Record<string, unknown>;
+    if (!Array.isArray(v4.diagnostic_events)) v4.diagnostic_events = diagnosticEvents;
+    if (!Array.isArray(v4.events)) v4.events = [];
+    if (!Array.isArray(v4.operations)) v4.operations = [];
+    if (!("soroban_meta" in v4)) v4.soroban_meta = null;
+    return candidate;
+  }
+
+  return {
+    v4: {
+      operations: [],
+      events: [],
+      diagnostic_events: diagnosticEvents,
+      soroban_meta: null,
+    },
+  };
+}
+
+function hasMethod<T extends string>(
+  value: unknown,
+  method: T,
+): value is Record<T, (...args: unknown[]) => unknown> {
+  return !!value && typeof value === "object" &&
+    typeof (value as Record<T, unknown>)[method] === "function";
+}
+
+function extractScValString(value: unknown): string | undefined {
+  if (!value) return undefined;
+  if (typeof value === "string") return value;
+
+  if (isRecord(value)) {
+    const arm = value._arm;
+    const raw = value._value;
+    if ((arm === "str" || arm === "sym") && isRecord(raw) && Array.isArray(raw.data)) {
+      return Buffer.from(raw.data).toString("utf8");
+    }
+  }
+
+  if (!hasMethod(value, "switch")) return undefined;
+  const switchName = (value.switch() as { name?: unknown } | undefined)?.name;
+  if (switchName !== "scvString" && switchName !== "scvSymbol") return undefined;
+
+  if (hasMethod(value, "str")) {
+    const raw = value.str();
+    if (raw instanceof Uint8Array) return Buffer.from(raw).toString("utf8");
+    if (typeof raw === "string") return raw;
+  }
+
+  if (hasMethod(value, "sym")) {
+    const raw = value.sym();
+    if (raw instanceof Uint8Array) return Buffer.from(raw).toString("utf8");
+    if (typeof raw === "string") return raw;
+  }
+
+  return undefined;
+}
+
+function extractDiagnosticEventDataStrings(event: unknown): string[] {
+  const values: unknown[] = [];
+
+  if (hasMethod(event, "event")) {
+    const inner = event.event();
+    if (hasMethod(inner, "body")) {
+      const body = inner.body();
+      const v0 = hasMethod(body, "v0")
+        ? body.v0()
+        : hasMethod(body, "value")
+        ? body.value()
+        : null;
+      if (v0 && hasMethod(v0, "data")) {
+        const data = v0.data();
+        if (hasMethod(data, "vec")) {
+          const vec = data.vec();
+          if (Array.isArray(vec)) values.push(...vec);
+        } else if (Array.isArray(data)) {
+          values.push(...data);
+        } else if (data !== undefined) {
+          values.push(data);
+        }
       }
-      return null;
-    }));
-  return decoded.flatMap((item) => item === null ? [] : [item]);
+    }
+  } else if (isRecord(event)) {
+    const body = event.body as Record<string, unknown> | undefined;
+    const bodyAttributes = isRecord(event._attributes)
+      ? ((event._attributes as Record<string, unknown>).event as Record<string, unknown> | undefined)
+          ?._attributes as Record<string, unknown> | undefined
+      : undefined;
+    const nestedBody = bodyAttributes?.body as Record<string, unknown> | undefined;
+    const nestedValue = nestedBody?._value as Record<string, unknown> | undefined;
+    const nestedAttributes = nestedValue?._attributes as Record<string, unknown> | undefined;
+    const v0 = body?.v0 as Record<string, unknown> | undefined;
+    const data = v0?.data ?? body?.data ?? nestedAttributes?.data;
+    if (Array.isArray(data)) {
+      values.push(...data);
+    } else if (isRecord(data) && Array.isArray(data._value)) {
+      values.push(...data._value);
+    } else if (data !== undefined) {
+      values.push(data);
+    }
+  }
+
+  return values
+    .map((value) => extractScValString(value))
+    .filter((value): value is string => !!value && value.trim().length > 0);
+}
+
+function synthesizeSimulationError(diagnosticEvents: unknown[]): string | undefined {
+  for (const event of diagnosticEvents) {
+    const values = extractDiagnosticEventDataStrings(event);
+    if (values.length > 0) return values[0];
+  }
+  return undefined;
+}
+
+function summarizeSimulationError(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "unknown";
+
+  const firstParagraph = trimmed.split(/\n\s*\n/, 1)[0] ?? trimmed;
+  const firstLine = firstParagraph.split("\n", 1)[0] ?? firstParagraph;
+  return firstLine.trim() || trimmed;
 }
 
 function findMatchingKey(
@@ -217,8 +392,15 @@ function buildReadout(
   envelopeJson: unknown,
   response: Record<string, unknown>,
   sourceReference: string,
+  simulationErrorOverride?: string,
 ): ErrorReadout {
   const serializedEnvelope = JSON.stringify(envelopeJson);
+  const latestLedgerCloseTime = typeof response.latestLedgerCloseTime === "number"
+    ? response.latestLedgerCloseTime
+    : typeof response.latestLedgerCloseTime === "string" &&
+        /^\d+$/.test(response.latestLedgerCloseTime.trim())
+    ? Number(response.latestLedgerCloseTime.trim())
+    : undefined;
 
   return {
     observationKind,
@@ -233,12 +415,10 @@ function buildReadout(
     diagnosticEventCount: decoded.diagnosticEvents.length || undefined,
     latestLedger:
       typeof response.latestLedger === "number" ? response.latestLedger : undefined,
-    latestLedgerCloseTime:
-      typeof response.latestLedgerCloseTime === "number"
-        ? response.latestLedgerCloseTime
-        : undefined,
+    latestLedgerCloseTime,
     rpcStatus: typeof response.status === "string" ? response.status : undefined,
-    simulationError: typeof response.error === "string" ? response.error : undefined,
+    simulationError: simulationErrorOverride ??
+      (typeof response.error === "string" ? response.error : undefined),
     sourceReference,
   };
 }
@@ -466,32 +646,76 @@ export async function buildFailedTransactionFromDirectError(
     };
   }
 
-  if (typeof submission.response.error !== "string" || !submission.response.error.trim()) {
-    throw new Error("rpc_simulate ingestion requires a non-empty error field.");
+  const sourceReference = typeof submission.response.txHash === "string" &&
+      submission.response.txHash.trim().length > 0
+    ? submission.response.txHash
+    : `rpcsim-${await createSyntheticHash(JSON.stringify(submission))}`;
+  const diagnosticEvents = await parseDiagnosticEvents(
+    submission.response.diagnosticEventsXdr ??
+      submission.response.events ??
+      submission.response.diagnosticEvents,
+  );
+  const simulationError = typeof submission.response.error === "string" &&
+      submission.response.error.trim()
+    ? submission.response.error
+    : synthesizeSimulationError(diagnosticEvents);
+  const resultJson = typeof submission.response.resultXdr === "string"
+    ? await parseResultXdr(submission.response.resultXdr)
+    : isRecord(submission.response.result)
+    ? submission.response.result
+    : null;
+  const metaJson = typeof submission.response.resultMetaXdr === "string"
+    ? await parseResultMetaXdr(submission.response.resultMetaXdr)
+    : isRecord(submission.response.resultMeta)
+    ? submission.response.resultMeta
+    : null;
+  const derivedResultKind = resultJson
+    ? extractRpcSendResultKind(resultJson)
+    : null;
+  const resultKind = derivedResultKind
+    ? `simulate:${derivedResultKind}`
+    : simulationError
+    ? `simulate:${normalizeCode(summarizeSimulationError(simulationError))}`
+    : typeof submission.response.status === "string" && submission.response.status.trim()
+    ? `simulate:${normalizeCode(submission.response.status)}`
+    : "simulate:unknown";
+
+  if (!simulationError && !resultJson && !metaJson && diagnosticEvents.length === 0) {
+    throw new Error(
+      "rpc_simulate ingestion requires an error string or rich result metadata.",
+    );
   }
 
-  const sourceReference = `rpcsim-${await createSyntheticHash(JSON.stringify(submission))}`;
-  const diagnosticEvents = await parseDiagnosticEvents(submission.response.events);
-  const resultKind = `simulate:${normalizeCode(
-    extractSimulationErrorHeadline(submission.response.error),
-  )}`;
-  const processingJson = buildProcessingJson(resultKind, diagnosticEvents, {
-    error: submission.response.error,
-    latestLedger:
-      typeof submission.response.latestLedger === "number"
-        ? submission.response.latestLedger
-        : undefined,
-    latestLedgerCloseTime:
-      typeof submission.response.latestLedgerCloseTime === "number"
-        ? submission.response.latestLedgerCloseTime
-        : undefined,
-    sourceLabel: submission.sourceLabel,
-  });
+  const processingJson = resultJson || metaJson
+    ? {
+      result: {
+        transaction_hash: sourceReference,
+        result: resultJson ?? {
+          [typeof submission.response.status === "string" &&
+          submission.response.status.trim()
+            ? normalizeCode(submission.response.status)
+            : "simulate_failed"]: {},
+        },
+      },
+      tx_apply_processing: normalizeTransactionMeta(metaJson, diagnosticEvents),
+    }
+    : buildProcessingJson(resultKind, diagnosticEvents, {
+      error: simulationError,
+      latestLedger:
+        typeof submission.response.latestLedger === "number"
+          ? submission.response.latestLedger
+          : undefined,
+      latestLedgerCloseTime:
+        typeof submission.response.latestLedgerCloseTime === "number"
+          ? submission.response.latestLedgerCloseTime
+          : undefined,
+      sourceLabel: submission.sourceLabel,
+    }, sourceReference);
   const decoded = buildDecodedTransactionContext(envelopeJson, processingJson);
   if (decoded.errorSignatures.length === 0) {
     decoded.errorSignatures = fallbackErrorSignatures(
       resultKind,
-      submission.response.error,
+      simulationError,
     );
   }
 
@@ -524,8 +748,13 @@ export async function buildFailedTransactionFromDirectError(
     ledgerSequence:
       typeof submission.response.latestLedger === "number"
         ? submission.response.latestLedger
+        : typeof submission.response.ledger === "number"
+        ? submission.response.ledger
         : 0,
-    ledgerCloseTime: observedAt,
+    ledgerCloseTime: normalizeTimestamp(
+      submission.response.createdAt ?? submission.response.latestLedgerCloseTime,
+      observedAt,
+    ),
     resultKind,
     soroban: true,
     primaryContractIds,
@@ -544,6 +773,7 @@ export async function buildFailedTransactionFromDirectError(
       envelopeJson,
       submission.response,
       sourceReference,
+      simulationError,
     ),
     rpcContext,
     sourcePayload: buildSourcePayload(submission, observedAt),
