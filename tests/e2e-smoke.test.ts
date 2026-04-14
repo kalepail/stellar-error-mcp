@@ -16,9 +16,111 @@ import {
 } from "../src/jobs.js";
 import { parseDirectErrorSubmission } from "../src/direct.js";
 
+const {
+  PRIMARY_CONTRACT_ID,
+  AUTH_CONTRACT_ID,
+  RECIPIENT_CONTRACT_ID,
+  TRANSFER_FIXTURE_XDR,
+  EXECUTE_FIXTURE_XDR,
+} = vi.hoisted(() => ({
+  PRIMARY_CONTRACT_ID:
+    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  AUTH_CONTRACT_ID:
+    "CBQVIRSH6EMJVR4SBEMUOZ3ZFFYI6FTQW7DMNESA2BB2XOVYG24FX47T",
+  RECIPIENT_CONTRACT_ID:
+    "CCMR63YE5T7MPWREF3PC5XNTTGXFSB4GYUGUIT5POHP2UGCS65TBIUUU",
+  TRANSFER_FIXTURE_XDR: "FIXTURE_TRANSFER_AUTH",
+  EXECUTE_FIXTURE_XDR: "FIXTURE_EXECUTE_AUTH",
+}));
+
 vi.mock("../src/xdr.js", () => ({
   deepDecodeXdr: (value: unknown) => value,
 }));
+
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+
+  const transferEnvelope = {
+    tx: {
+      tx: {
+        operations: [
+          {
+            body: {
+              invoke_host_function: {
+                host_function: {
+                  invoke_contract: {
+                    contract_address: PRIMARY_CONTRACT_ID,
+                    function_name: "transfer",
+                    args: [AUTH_CONTRACT_ID, RECIPIENT_CONTRACT_ID, 100000000],
+                  },
+                },
+                auth: [
+                  {
+                    credentials: {
+                      address: AUTH_CONTRACT_ID,
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    },
+  };
+
+  const executeEnvelope = {
+    tx: {
+      tx: {
+        operations: [
+          {
+            body: {
+              invoke_host_function: {
+                host_function: {
+                  invoke_contract: {
+                    contract_address: AUTH_CONTRACT_ID,
+                    function_name: "execute",
+                    args: [
+                      { contract: PRIMARY_CONTRACT_ID },
+                      { function: "transfer" },
+                      {
+                        sender: AUTH_CONTRACT_ID,
+                        recipient: RECIPIENT_CONTRACT_ID,
+                        amount: 100000000,
+                      },
+                    ],
+                  },
+                },
+                auth: [
+                  {
+                    credentials: {
+                      address: AUTH_CONTRACT_ID,
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    },
+  };
+
+  return {
+    ...actual,
+    xdr: {
+      ...actual.xdr,
+      TransactionEnvelope: {
+        ...actual.xdr.TransactionEnvelope,
+        fromXDR: vi.fn((value: string) => {
+          if (value === TRANSFER_FIXTURE_XDR) return transferEnvelope;
+          if (value === EXECUTE_FIXTURE_XDR) return executeEnvelope;
+          return actual.xdr.TransactionEnvelope.fromXDR(value, "base64");
+        }),
+      },
+    },
+  };
+});
 
 interface RealSimulationFixture {
   kind: "rpc_simulate";
