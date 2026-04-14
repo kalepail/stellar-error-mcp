@@ -1,114 +1,117 @@
 # stellar-error-mcp
 
-A Cloudflare Worker that continuously scans the Stellar blockchain for failed Soroban transactions, accepts direct RPC error submissions for failed `sendTransaction` and `simulateTransaction` calls, runs all long-lived work on Cloudflare Workflows, and exposes the resulting error knowledge base via a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server.
+`stellar-error-mcp` is a Cloudflare Worker that turns failed Soroban transactions into a searchable error knowledge base. It ingests failures from scheduled ledger scans or direct RPC submissions, enriches them with contract and transaction context, analyzes them with Cloudflare AI, and serves the results through HTTP endpoints and a Model Context Protocol (MCP) server.
 
-## How it works
+## What The App Does
 
-1. **Scan** — Every 5 minutes, fetches recent ledgers from the Stellar Archive RPC and extracts failed Soroban transactions (invoke, restore, extend operations).
-2. **Forward** — Internal callers can submit raw RPC failures directly. Exact duplicates are detected inline; new errors are normalized once, staged in R2, and handed off to Workflow-backed async jobs.
-3. **Fingerprint** — Computes a SHA-256 fingerprint from contracts, function name, error signatures, and result kind. Duplicate errors increment a counter instead of being re-analyzed.
-4. **Semantic dedup** — New errors are embedded with `@cf/baai/bge-base-en-v1.5` and checked against a Vectorize index. Similar errors (score >= 0.90) are linked together.
-5. **Decode and enrich** — Each failed transaction is normalized into a first-class decoded artifact containing the raw envelope/processing JSON, recursively XDR-decoded views, invoke/auth/resource summaries, operation-level effects, ledger changes, and touched contract IDs.
-6. **Analyze** — Unique errors are sent to a Cloudflare AI model with the full enriched transaction plus contract specs and decoded WASM custom sections, encoded as TOON for high-fidelity LLM input. The model returns a structured analysis: summary, evidence-based classification, likely cause, suggested fix, related codes, debug steps, detailed analysis, and confidence level.
-7. **Store** — Canonical error entries, example transactions, tx-hash pointers, public job snapshots, private Workflow inputs, staged Workflow artifacts, result artifacts, and contract metadata snapshots are persisted to R2. Each error also emits a curated Markdown document under `search-docs/` for AI Search indexing. Vectors are indexed in Vectorize for ingest-time semantic dedup.
-8. **Serve** — An MCP server exposes tools (`diagnose_error`, `get_error`, `get_error_example`, `decode_xdr`) so AI agents can query the knowledge base with natural language or raw XDR blobs.
+This service is built to answer three developer questions after a Soroban failure:
 
-## Prerequisites
+- what failed
+- why it likely failed
+- what to try next
 
-- Node.js
-- A Cloudflare account with access to Workers, Workflows, R2, KV, Vectorize, AI, and AI Search
-- A Stellar Archive RPC token
+For each failed transaction it can:
 
-## Cloudflare resources
+- normalize the raw RPC payload into a consistent internal record
+- decode XDR and extract contracts, functions, operations, and error signatures
+- deduplicate exact and near-duplicate failures
+- fetch contract metadata and WASM custom-section details
+- generate a structured diagnosis with evidence and suggested fixes
+- store the corpus in R2, KV, Vectorize, and AI Search
+- expose the knowledge base to agents over MCP
 
-Create these before deploying:
+## Processing Flow
 
-| Resource | Name / Config |
-|---|---|
-| R2 Bucket | `stellar-errors` |
-| KV Namespace | any — put the ID in `wrangler.jsonc` |
-| Vectorize Index | `stellar-error-fingerprints` (model: `@cf/baai/bge-base-en-v1.5`) |
-| AI Search | `stellar-errors` (R2-backed, scoped to `search-docs/**`) |
+1. **Collect**: scan recent ledgers or accept a direct `sendTransaction` / `simulateTransaction` failure.
+2. **Normalize**: convert the failure into a first-class transaction artifact.
+3. **Fingerprint**: hash the failure shape for exact deduplication.
+4. **Deduplicate semantically**: compare embeddings in Vectorize to group similar failures.
+5. **Enrich**: decode the transaction, summarize auth/resource data, and fetch contract metadata.
+6. **Analyze**: ask Cloudflare AI for a structured diagnosis.
+7. **Store**: persist canonical errors, reference transactions, workflow artifacts, and search documents.
+8. **Serve**: make the results available over HTTP and MCP tools.
+
+## Main Components
+
+| Path | Responsibility |
+| --- | --- |
+| `src/index.ts` | Worker entrypoint, routing, cron handling |
+| `src/workflows.ts` | Workflow orchestration for direct errors and ledger scans |
+| `src/jobs.ts` | Job lifecycle, preflight duplicate handling, public job status |
+| `src/direct.ts` | Parsing and normalization for direct RPC failures |
+| `src/stellar.ts` | Ledger scanning and Stellar RPC access |
+| `src/transaction.ts` | Transaction decoding and metadata extraction |
+| `src/contracts.ts` | Contract metadata and WASM custom-section retrieval |
+| `src/analysis.ts` | AI prompts and structured diagnosis generation |
+| `src/storage.ts` | R2, KV, Vectorize, and AI Search persistence |
+| `src/mcp.ts` | MCP server and tool definitions |
+
+## Cloudflare Resources
+
+Provision these before deploying:
+
+| Resource | Expected Binding / Name |
+| --- | --- |
+| R2 bucket | `stellar-errors` |
+| R2 bucket | `stellar-error-runtime` |
+| KV namespace | bound as `CURSOR_KV` |
+| Vectorize index | `stellar-error-fingerprints` |
+| AI Search instance | `stellar-errors` |
 | Workflows | `stellar-error-direct`, `stellar-error-ledger-range` |
 
-## Setup
+The committed `wrangler.jsonc` uses concrete resource names and IDs. Replace them with resources from your own Cloudflare account if you deploy this elsewhere.
+
+## Local Setup
+
+Install dependencies:
 
 ```bash
 npm install
 ```
 
-Review `wrangler.jsonc` before deploying:
+Create a `.dev.vars` file:
 
-- If you are deploying in a different Cloudflare account, replace the bound resource IDs and names with resources from that account.
-- Keep local preview and production resources separate if you do not want preview traffic writing into the production data plane.
-
-Create a `.dev.vars` file with your RPC token:
-
-```
-STELLAR_ARCHIVE_RPC_TOKEN=your_token_here
+```bash
+STELLAR_ARCHIVE_RPC_TOKEN=your_archive_rpc_token
 ```
 
-Optional real-time RPC settings for Quasar Pro:
+Optional overrides:
 
-```
+```bash
 STELLAR_RPC_ENDPOINT=https://rpc-pro.lightsail.network
 STELLAR_RPC_AUTH_MODE=header
-```
 
-`STELLAR_ARCHIVE_RPC_TOKEN` is reused for both archive and real-time RPC by default. If you prefer URL-path auth, set `STELLAR_RPC_AUTH_MODE=path`.
-
-Optional testnet defaults for direct error submissions:
-
-```
 STELLAR_TESTNET_RPC_ENDPOINT=https://your-testnet-rpc.example.com
 STELLAR_TESTNET_ARCHIVE_RPC_ENDPOINT=https://your-testnet-archive-rpc.example.com
 STELLAR_TESTNET_RPC_TOKEN=optional_testnet_token
 STELLAR_TESTNET_RPC_AUTH_MODE=header
-```
 
-Optional analysis controls:
-
-```
 AI_ANALYSIS_TIMEOUT_MS=3600000
 AI_ANALYSIS_MAX_DURATION_MS=3600000
 ```
 
-`AI_ANALYSIS_MODEL` is treated as authoritative for final diagnosis. The Worker retries that model until the max duration window is exhausted and does not fall back to a smaller-context model.
-
-For deployed admin endpoints, also set a management token secret:
+For deployed management endpoints:
 
 ```bash
 wrangler secret put MANAGEMENT_TOKEN
 ```
 
-Provision or update the AI Search instance from code instead of the dashboard:
-
-```bash
-export CLOUDFLARE_ACCOUNT_ID=...
-export CLOUDFLARE_AI_SEARCH_TOKEN_ID=...
-npm run provision:ai-search
-```
-
-If you are already logged in with `wrangler login`, the script will automatically reuse the active Wrangler auth token. Set `CLOUDFLARE_AI_SEARCH_API_TOKEN` only if you want to override that behavior.
-
-If you do not already have an AI Search token registered, provide `CLOUDFLARE_SERVICE_API_ID` and `CLOUDFLARE_SERVICE_API_KEY` instead of `CLOUDFLARE_AI_SEARCH_TOKEN_ID`. Those credentials come from the service-token flow documented in Cloudflare's AI Search API setup.
-
 ## Development
 
 ```bash
-npm run dev         # local dev server with cron test mode
-npm run types       # generate Cloudflare Worker types
+npm run dev
+npm run types
+npm run check
+npm test
 ```
 
-Start or reuse the recurring scan Workflow:
+Trigger the recurring scanner locally:
 
 ```bash
 curl -X POST http://localhost:8787/trigger
 ```
 
-For deployed `/trigger` and `/batch` endpoints, send either `Authorization: Bearer <token>` or `x-management-token: <token>`.
-
-Forward a direct RPC error:
+Submit a direct RPC error:
 
 ```bash
 curl -X POST http://localhost:8787/forward-error \
@@ -120,45 +123,64 @@ curl -X POST http://localhost:8787/forward-error \
       "status": "ERROR",
       "hash": "abc123",
       "latestLedger": 123,
-      "errorResultXdr": "AAAA...",
-      "diagnosticEventsXdr": ["AAAA..."]
+      "errorResultXdr": "AAAA..."
     }
   }'
 ```
 
-To force a fresh analysis for an exact duplicate, send `forceReanalyze: true` in the JSON body. This is intended for admin use on `/forward-error` when you want to refresh stored analysis after decoder or contract-fetch changes.
-
-To analyze a direct error against testnet or another non-default RPC, include per-request RPC context:
-
-```json
-{
-  "kind": "rpc_simulate",
-  "network": "testnet",
-  "rpcEndpoint": "https://your-testnet-rpc.example.com",
-  "archiveRpcEndpoint": "https://your-testnet-archive-rpc.example.com",
-  "rpcAuthMode": "header",
-  "transactionXdr": "AAAA...",
-  "response": {
-    "error": "HostError: ...",
-    "events": ["AAAA..."]
-  }
-}
-```
-
-If `network` is `testnet` and explicit endpoints are omitted, the Worker will use `STELLAR_TESTNET_RPC_ENDPOINT` and `STELLAR_TESTNET_ARCHIVE_RPC_ENDPOINT` when configured.
-If those are not configured, direct testnet requests automatically fail over across the current public testnet RPC provider list from Stellar's provider docs. The Worker stores the last successful testnet endpoint in KV and tries that provider first on subsequent testnet requests.
-
-If the submission is an exact duplicate, the endpoint returns `200 { status: "duplicate", ... }` immediately.
-
-If the submission is new, poll the returned job later:
+If the failure is new, the API returns a job ID you can poll:
 
 ```bash
 curl http://localhost:8787/jobs/de_<id>
 ```
 
-The public job response is the only polling surface. There is no `/jobs/:jobId/process` endpoint.
+## HTTP Endpoints
 
-Run the live RPC shape-capture suite:
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Service status and last processed ledger |
+| `POST` | `/trigger` | Start or reuse the recurring scan workflow |
+| `POST` | `/batch?hours=24` | Queue a recent backfill |
+| `POST` | `/batch?start=N&end=M` | Queue a ledger-range backfill |
+| `POST` | `/forward-error` | Ingest a direct failed RPC response |
+| `GET` | `/jobs/:jobId` | Poll a workflow-backed async job |
+| `POST` | `/mcp` | MCP protocol endpoint |
+
+## MCP Tools
+
+The MCP server exposes:
+
+- `diagnose_error`
+- `get_error`
+- `get_error_example`
+- `decode_xdr`
+- `search_errors`
+
+These tools let agents search the corpus, fetch stored examples, and decode raw XDR payloads without going through the Cloudflare dashboard.
+
+## AI Search Provisioning
+
+The repo includes `scripts/provision-ai-search.mjs` to create or update the AI Search instance from code.
+
+Example:
+
+```bash
+export CLOUDFLARE_ACCOUNT_ID=...
+export CLOUDFLARE_AI_SEARCH_TOKEN_ID=...
+npm run provision:ai-search
+```
+
+If you are already authenticated with `wrangler login`, the script can reuse the Wrangler auth token automatically. You can also override that with `CLOUDFLARE_AI_SEARCH_API_TOKEN`.
+
+## Testing
+
+Run the unit and integration tests with:
+
+```bash
+npm test
+```
+
+There is also an opt-in live RPC capture suite:
 
 ```bash
 export STELLAR_ARCHIVE_RPC_TOKEN=...
@@ -167,81 +189,19 @@ export STELLAR_RPC_AUTH_MODE=header
 npm run test:live-rpc
 ```
 
-Optional for networks without Friendbot:
+Live observations are written under `.context/live-rpc-observations/` and are intentionally ignored by git.
 
-```bash
-export LIVE_RPC_SOURCE_SECRET=SC...
-```
+## Storage Layout
 
-The live suite writes raw and normalized observations to `.context/live-rpc-observations/<network>/` so you can inspect the exact `simulateTransaction`, `sendTransaction`, and `getTransaction` payload shapes returned by the RPC.
+- `errors/<fingerprint>.json`: canonical error records
+- `reference-transactions/<fingerprint>.json`: stored example transactions and contract metadata
+- `jobs/<jobId>.json`: public job snapshots
+- `job-inputs/<jobId>.json`: workflow input payloads
+- `job-results/<jobId>.json`: larger result artifacts
+- `job-staging/<jobId>/...`: staged workflow artifacts
+- `search-docs/<fingerprint>.md`: AI Search source documents
+- KV `tx:<txHash>`: hash-to-fingerprint pointers
 
-## Deploy
+## License
 
-```bash
-npm run deploy
-```
-
-## HTTP endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Service status and last processed ledger |
-| `POST` | `/trigger` | Start or reuse the recurring scan Workflow |
-| `POST` | `/batch?hours=24` | Create an async backfill job for a time range |
-| `POST` | `/batch?start=N&end=M` | Backfill a specific ledger range |
-| `POST` | `/forward-error` | Return an inline duplicate or create a Workflow-backed direct error job |
-| `GET` | `/jobs/:jobId` | Public polling endpoint for Workflow-backed jobs |
-| `POST` | `/mcp` | MCP protocol endpoint |
-
-## MCP tools
-
-**`diagnose_error`** — Search the knowledge base with an error message, contract ID, or base64 XDR blob. Returns an AI-synthesized diagnosis with sources.
-
-**`get_error`** — Retrieve a specific error entry by fingerprint or find entries containing a transaction hash. Returns the error entry together with the stored example transaction record when available.
-
-**`get_error_example`** — Get the stored example transaction record for a fingerprint, including the raw transaction JSON, decoded transaction context, and contract metadata snapshot used during analysis.
-
-**`decode_xdr`** — Decode arbitrary base64 XDR blobs into rich JSON with automatic type guessing.
-
-**`search_errors`** — Return raw matching AI Search chunks without synthesized analysis. Supports metadata filters aligned with the `search-docs/` schema.
-
-## Project structure
-
-```
-src/
-  index.ts          Entry point, HTTP routing, cron orchestration
-  workflows.ts      Workflow classes for direct errors and ledger ranges
-  jobs.ts           Job id generation, duplicate preflight, public sanitization
-  stellar.ts        Ledger scanning, RPC client, transaction extraction
-  transaction.ts    Shared transaction decoding and normalization helpers
-  analysis.ts       AI analysis prompts and model calls
-  fingerprint.ts    SHA-256 fingerprinting, error signature extraction
-  ai-search.ts      AI Search document generation, metadata schema, and filters
-  storage.ts        R2 / KV / Vectorize operations
-  contracts.ts      On-chain contract spec and WASM custom section fetching/caching
-  mcp.ts            MCP server and tool definitions
-  xdr.ts            Base64 XDR decoding utilities
-  types.ts          TypeScript type definitions
-```
-
-## Configuration
-
-Key constants in `src/workflows.ts`:
-
-| Constant | Default | Description |
-|---|---|---|
-| `MAX_LEDGERS_PER_CYCLE` | 200 | Ledgers processed per cron trigger |
-| `COLD_START_LOOKBACK` | 50 | Ledgers to look back on first run |
-
-AI Search and analysis models are configured separately in `wrangler.jsonc` under `vars`.
-
-## R2 layout
-
-- `errors/<fingerprint>.json`: canonical structured error records
-- `reference-transactions/<fingerprint>.json`: stored example transactions and contract snapshots
-- `jobs/<jobId>.json`: public async job snapshots
-- `job-inputs/<jobId>.json`: private Workflow inputs and staged-artifact references
-- `job-results/<jobId>.json`: larger batch result artifacts
-- `job-staging/<jobId>/...`: staged Workflow transaction artifacts and step results
-- KV `tx:<txHash>`: direct tx-hash to fingerprint pointers
-- `search-docs/<fingerprint>.md`: the only documents intended for AI Search indexing
+This project is licensed under Apache 2.0. See [LICENSE](./LICENSE).
