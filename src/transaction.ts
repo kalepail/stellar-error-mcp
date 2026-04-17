@@ -200,12 +200,12 @@ function readXdrSwitchName(value: unknown): string | undefined {
 
 function bufferToContractId(value: unknown): string | undefined {
   if (value instanceof Uint8Array && value.length === 32) {
-    return StrKey.encodeContract(value);
+    return StrKey.encodeContract(Buffer.from(value));
   }
   if (Array.isArray(value) && value.every((item) => typeof item === "number")) {
     const bytes = Uint8Array.from(value);
     if (bytes.length === 32) {
-      return StrKey.encodeContract(bytes);
+      return StrKey.encodeContract(Buffer.from(bytes));
     }
   }
   return undefined;
@@ -354,7 +354,9 @@ function getInvokeContractArgsFromOperation(operation: unknown): {
 
   const invoke = hasMethod(body, "invokeHostFunctionOp")
     ? body.invokeHostFunctionOp()
-    : body.value();
+    : hasMethod(body, "value")
+    ? body.value()
+    : undefined;
   if (!invoke || !hasMethod(invoke, "hostFunction")) return null;
 
   const hostFunction = invoke.hostFunction();
@@ -367,8 +369,15 @@ function getInvokeContractArgsFromOperation(operation: unknown): {
 
   const invokeContract = hasMethod(hostFunction, "invokeContract")
     ? hostFunction.invokeContract()
-    : hostFunction.value();
+    : hasMethod(hostFunction, "value")
+    ? hostFunction.value()
+    : undefined;
   if (!invokeContract) return null;
+
+  const args = hasMethod(invokeContract, "args")
+    ? invokeContract.args()
+    : undefined;
+  const auth = hasMethod(invoke, "auth") ? invoke.auth() : undefined;
 
   return {
     contractId:
@@ -379,8 +388,8 @@ function getInvokeContractArgsFromOperation(operation: unknown): {
       hasMethod(invokeContract, "functionName")
         ? xdrStringValue(invokeContract.functionName())
         : undefined,
-    args: hasMethod(invokeContract, "args") ? invokeContract.args() : undefined,
-    auth: hasMethod(invoke, "auth") ? invoke.auth() : undefined,
+    args: Array.isArray(args) ? args : undefined,
+    auth: Array.isArray(auth) ? auth : undefined,
   };
 }
 
@@ -490,12 +499,13 @@ export function collectContractIdsFromValue(obj: unknown): string[] {
 function collectFunctionNames(value: unknown): string[] {
   const transaction = getTransactionFromEnvelope(value);
   if (transaction && hasMethod(transaction, "operations")) {
-    return transaction
-      .operations()
-      .flatMap((operation: unknown) => {
+    const operations = transaction.operations();
+    return Array.isArray(operations)
+      ? operations.flatMap((operation: unknown) => {
         const invoke = getInvokeContractArgsFromOperation(operation);
         return invoke?.functionName ? [invoke.functionName] : [];
-      });
+      })
+      : [];
   }
 
   const results: string[] = [];
@@ -692,7 +702,8 @@ export function extractFunctionName(envelopeJson: unknown): string {
 export function extractEnvelopeOperations(envelope: unknown): unknown[] {
   const transaction = getTransactionFromEnvelope(envelope);
   if (transaction && hasMethod(transaction, "operations")) {
-    return transaction.operations();
+    const operations = transaction.operations();
+    return Array.isArray(operations) ? operations : [];
   }
 
   const candidates = [
